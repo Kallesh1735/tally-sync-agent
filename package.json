@@ -1,0 +1,47 @@
+{
+  "name": "giropie-tally-agent",
+  "version": "1.0.0",
+  "description": "GIROPie Tally Sync Agent - Sync invoices from Tally Prime to GIROPie",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "build": "electron-builder --win",
+    "build:all": "electron-builder --win --mac --linux"
+  },
+  "author": "GIROPie",
+  "license": "MIT",
+  "devDependencies": {
+    "electron": "^26.0.0",
+    "electron-builder": "^24.13.3"
+  },
+  "dependencies": {
+    "fast-xml-parser": "^5.3.3",
+    "firebase": "^12.8.0"
+  },
+  "build": {
+    "appId": "com.giropie.tally-agent",
+    "productName": "GIROPie Tally Agent",
+    "directories": {
+      "output": "dist"
+    },
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "signAndEditExecutable": false,
+      "forceCodeSigning": false
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "GIROPie Tally Agent"
+    }
+  }
+}

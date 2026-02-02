@@ -1,0 +1,32 @@
+<!-- index.html - Simple UI for the GIROPie Tally Sync Agent -->
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>GIROPie Tally Sync Agent</title>
+    <style>
+      body { font-family: sans-serif; display:flex; align-items:center; justify-content:center; height:100vh; margin:0; }
+      #container { text-align:center; }
+      button { padding:10px 20px; font-size:16px; }
+    </style>
+  </head>
+  <body>
+    <div id="container">
+      <h1>GIROPie Tally Sync Agent</h1>
+
+      <!-- Simple login form -->
+      <div id="login">
+        <input id="email" type="email" placeholder="Email" />
+        <input id="password" type="password" placeholder="Password" />
+        <button id="loginBtn">Login</button>
+        <div id="loginMsg" style="margin-top:8px;color:#444;"></div>
+      </div>
+
+      <hr style="margin:20px 0;">
+
+      <button id="syncBtn">Sync from Tally</button>
+    </div>
+
+    <script src="renderer.js"></script>
+  </body>
+</html>
