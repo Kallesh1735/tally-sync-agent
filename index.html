@@ -1,32 +1,70 @@
-<!-- index.html - Simple UI for the GIROPie Tally Sync Agent -->
+<!-- index.html - GIROPie Tally Sync Agent -->
 <!doctype html>
 <html>
   <head>
     <meta charset="utf-8" />
     <title>GIROPie Tally Sync Agent</title>
-    <style>
-      body { font-family: sans-serif; display:flex; align-items:center; justify-content:center; height:100vh; margin:0; }
-      #container { text-align:center; }
-      button { padding:10px 20px; font-size:16px; }
-    </style>
+    <link rel="stylesheet" href="base.css" />
   </head>
   <body>
-    <div id="container">
-      <h1>GIROPie Tally Sync Agent</h1>
+    <div class="container">
+      
+      <!-- Header -->
+      <header class="header">
+        <h1>GIROPie Tally Agent</h1>
+        <p class="subtitle">Sync invoices from Tally Prime</p>
+      </header>
 
-      <!-- Simple login form -->
-      <div id="login">
-        <input id="email" type="email" placeholder="Email" />
-        <input id="password" type="password" placeholder="Password" />
-        <button id="loginBtn">Login</button>
-        <div id="loginMsg" style="margin-top:8px;color:#444;"></div>
+      <!-- Screen 1: Login -->
+      <div id="screen-login" class="screen">
+        <div class="card">
+          <h2>Login</h2>
+          <input id="email" type="email" placeholder="Email" class="input" />
+          <input id="password" type="password" placeholder="Password" class="input" />
+          <button id="loginBtn" class="btn btn-primary">Login</button>
+          <div id="loginMsg" class="msg"></div>
+        </div>
       </div>
 
-      <hr style="margin:20px 0;">
+      <!-- Screen 2: Method Selection -->
+      <div id="screen-method" class="screen" style="display:none;">
+        <div class="card">
+          <h2>Choose Sync Method</h2>
+          <div class="method-cards">
+            <button id="method-live" class="method-card">
+              <span class="method-icon">⚡</span>
+              <span class="method-title">Live Sync</span>
+              <span class="method-desc">Connect directly to Tally</span>
+            </button>
+            <button id="method-folder" class="method-card">
+              <span class="method-icon">📁</span>
+              <span class="method-title">Folder Import</span>
+              <span class="method-desc">Watch folder for XML files</span>
+            </button>
+          </div>
+          <button id="method-back-to-login" class="btn btn-secondary">Back</button>
+        </div>
+      </div>
 
-      <button id="syncBtn">Sync from Tally</button>
+      <!-- Screen 3: Sync -->
+      <div id="screen-sync" class="screen" style="display:none;">
+        <div class="card">
+          <h2>Sync: <span id="selectedMethodText"></span></h2>
+          <div class="sync-visual">
+            <div class="sync-icon">🔄</div>
+          </div>
+          <div id="syncMsg" class="msg"></div>
+          <button id="startSyncBtn" class="btn btn-primary">Start Sync</button>
+          <button id="changeMethodBtn" class="btn btn-secondary">Change Method</button>
+        </div>
+      </div>
+
+      <!-- Footer -->
+      <footer class="footer">
+        <p>v1.0.0 | <a href="https://giropie.com" target="_blank">giropie.com</a></p>
+      </footer>
+
     </div>
-
     <script src="renderer.js"></script>
   </body>
 </html>

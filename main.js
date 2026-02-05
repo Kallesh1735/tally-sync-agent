@@ -1,4 +1,4 @@
- // main.js
+// main.js
 // Electron main process
 // - Creates app window
 // - Handles Firebase login + token persistence
@@ -7,9 +7,9 @@ console.log("USING MAIN.JS FROM:", __filename);
 
 const { XMLParser } = require("fast-xml-parser");
 
-// Production Firebase Functions URL (HTTPS)
+// Production Vercel API URL (HTTPS)
 const BACKEND_SYNC_URL =
-  "https://us-central1-giropie-frontend.cloudfunctions.net/syncTally";
+  "https://giro-pie-frontend.vercel.app/api/sync-tally";
 
 const { app, BrowserWindow, ipcMain } = require("electron");
 const path = require("path");
@@ -295,8 +295,10 @@ function sendInvoicesToBackend(invoices) {
   });
 }
 
- function extractInvoicesFromTallyXML(xml) {
-  // Use attribute prefix so attributes don't collide with child nodes
+
+
+
+  function extractInvoicesFromTallyXML(xml) {
   const parser = new XMLParser({
     ignoreAttributes: false,
     attributeNamePrefix: "@_",
@@ -308,45 +310,36 @@ function sendInvoicesToBackend(invoices) {
   try {
     json = parser.parse(xml);
   } catch (err) {
-    console.error("Failed to parse Tally XML:", err && err.message);
+    console.error("Failed to parse Tally XML:", err.message);
     return [];
   }
 
-  // Tally can place TALLYMESSAGE (and VOUCHER) in many nested locations.
-  // Collect all VOUCHER nodes recursively under the BODY so we don't miss them.
-  const body = json?.ENVELOPE?.BODY || {};
+  const body = json?.ENVELOPE?.BODY;
+  if (!body) return [];
 
+  // -----------------------------
+  // Collect all VOUCHER nodes
+  // -----------------------------
   const vouchers = [];
 
-  const collectVouchers = (node) => {
-    if (!node || typeof node !== 'object') return;
+  const collect = (node) => {
+    if (!node || typeof node !== "object") return;
 
-    // If this node directly contains VOUCHER or an array of VOUCHERs
     if (node.VOUCHER) {
       if (Array.isArray(node.VOUCHER)) vouchers.push(...node.VOUCHER);
       else vouchers.push(node.VOUCHER);
     }
 
-    // If node itself is a VOUCHER entry
-    if (node['VOUCHER.TALLY'] || node['VOUCHER']) {
-      // handled above
-    }
-
-    // Recurse into all child properties
-    for (const k of Object.keys(node)) {
-      const child = node[k];
-      if (Array.isArray(child)) {
-        for (const c of child) collectVouchers(c);
-      } else if (child && typeof child === 'object') {
-        collectVouchers(child);
-      }
+    for (const key of Object.keys(node)) {
+      const child = node[key];
+      if (Array.isArray(child)) child.forEach(collect);
+      else if (typeof child === "object") collect(child);
     }
   };
 
-  collectVouchers(body);
+  collect(body);
 
-  console.log('FOUND VOUCHERS (after recursive search):', vouchers.length);
-  if (vouchers.length === 0) return [];
+  console.log("FOUND VOUCHERS:", vouchers.length);
 
   const invoices = [];
 
@@ -354,88 +347,118 @@ function sendInvoicesToBackend(invoices) {
     if (!obj) return null;
     if (obj[name] !== undefined) return obj[name];
     if (obj[`@_${name}`] !== undefined) return obj[`@_${name}`];
-    // sometimes the value is held in '#text'
-    if (obj['#text'] !== undefined) return obj['#text'];
+    if (obj["#text"] !== undefined) return obj["#text"];
     return null;
   };
 
-  for (const msg of vouchers) {
-    const v = msg.VOUCHER || msg;
-    const vType = getVal(v, 'VOUCHERTYPENAME');
-    if (!v || vType !== 'Sales') continue;
+  // -----------------------------
+  // Process each voucher
+  // -----------------------------
+  for (const v of vouchers) {
+    const voucherType =
+      String(getVal(v, "VOUCHERTYPENAME") || getVal(v, "VCHTYPE") || "")
+        .toUpperCase();
 
-    // ---------- Core identity ----------
-    const sourceId = getVal(v, 'REMOTEID') || null;
-    const invoiceNo = getVal(v, 'VOUCHERNUMBER') ? String(getVal(v, 'VOUCHERNUMBER')) : null;
-    const invoiceDate = getVal(v, 'DATE') ? String(getVal(v, 'DATE')) : null;
+    // ✅ Accept Sales, SALES GST, etc.
+    if (!voucherType.includes("SALE")) continue;
 
-    // ---------- Ledger processing ----------
-    const ledgerRaw = v["ALLLEDGERENTRIES.LIST"] || v["ALLLEDGERENTRIES.LIST"];
-    const ledgerEntries = Array.isArray(ledgerRaw) ? ledgerRaw : ledgerRaw ? [ledgerRaw] : [];
+    const invoiceNo = getVal(v, "VOUCHERNUMBER")
+      ? String(getVal(v, "VOUCHERNUMBER"))
+      : null;
 
-    let customerName = null;
+    const invoiceDate = getVal(v, "DATE")
+      ? String(getVal(v, "DATE"))
+      : null;
+
+    const sourceId = getVal(v, "REMOTEID") || null;
+
+    // ✅ MOST IMPORTANT LINE (THIS FIXES ABC)
+    let customerName =
+      getVal(v, "PARTYLEDGERNAME") ||
+      getVal(v, "PARTYNAME") ||
+      null;
+
+    const ledgerRaw = v["ALLLEDGERENTRIES.LIST"];
+    const ledgerEntries = Array.isArray(ledgerRaw)
+      ? ledgerRaw
+      : ledgerRaw
+      ? [ledgerRaw]
+      : [];
+
     let totalAmount = 0;
     let outstandingAmount = 0;
     let tdsAmount = 0;
     let tcsAmount = 0;
 
+    // -----------------------------
+    // Fallback: detect party ledger ONLY if missing
+    // -----------------------------
+    if (!customerName) {
+      for (const e of ledgerEntries) {
+        const ledgerName = getVal(e, "LEDGERNAME");
+        const amount = Number(getVal(e, "AMOUNT") || 0);
+        const isParty =
+          String(getVal(e, "ISPARTYLEDGER") || "").toLowerCase() === "yes";
+
+        if (isParty && ledgerName) {
+          customerName = ledgerName;
+          outstandingAmount = Math.abs(amount);
+          break;
+        }
+      }
+    }
+
+    // -----------------------------
+    // Totals & taxes
+    // -----------------------------
     for (const e of ledgerEntries) {
-      const ledgerName = getVal(e, 'LEDGERNAME');
-      const amount = Number(getVal(e, 'AMOUNT') || 0);
+      const ledgerName = getVal(e, "LEDGERNAME");
+      const amount = Number(getVal(e, "AMOUNT") || 0);
+      const upper = String(ledgerName || "").toUpperCase();
 
-      // Party ledger (value can be attribute or tag)
-      const isParty = String(getVal(e, 'ISPARTYLEDGER') || '').toLowerCase() === 'yes';
-      if (isParty) {
-        customerName = ledgerName;
-        outstandingAmount = Math.abs(amount);
-        continue;
-      }
-
-      if (amount > 0) totalAmount += amount;
-
-      if (ledgerName && String(ledgerName).toUpperCase().includes('TDS')) {
-        tdsAmount += Math.abs(amount);
-      }
-
-      if (ledgerName && String(ledgerName).toUpperCase().includes('TCS')) {
-        tcsAmount += Math.abs(amount);
-      }
+      if (amount < 0) totalAmount += Math.abs(amount);
+      if (upper.includes("TDS")) tdsAmount += Math.abs(amount);
+      if (upper.includes("TCS")) tcsAmount += Math.abs(amount);
     }
 
-    // ---------- Credit & due ----------
-    let creditPeriodDays = null;
-    const creditRaw = getVal(v, 'CREDITPERIOD');
-    if (creditRaw) {
-      const match = String(creditRaw).match(/\d+/);
-      if (match) creditPeriodDays = Number(match[0]);
+    if (!customerName) {
+      console.warn(
+        "Skipping voucher (no PARTYLEDGERNAME):",
+        invoiceNo
+      );
+      continue;
     }
 
-    let dueDate = null;
-    if (invoiceDate && creditPeriodDays !== null) {
-      const y = Number(invoiceDate.slice(0, 4));
-      const m = Number(invoiceDate.slice(4, 6)) - 1;
-      const d = Number(invoiceDate.slice(6, 8));
-      const baseDate = new Date(y, m, d);
-      baseDate.setDate(baseDate.getDate() + creditPeriodDays);
-      dueDate = baseDate.toISOString().slice(0, 10);
-    }
-
-    // ---------- Status ----------
-    let invoiceStatus = "UNPAID";
-    if (outstandingAmount === 0) invoiceStatus = "PAID";
-    else if (outstandingAmount < totalAmount)
-      invoiceStatus = "PARTIALLY_PAID";
-
-    // ---------- Items ----------
-    const invRaw = v["ALLINVENTORYENTRIES.LIST"] || v["ALLINVENTORYENTRIES.LIST"];
-    const inventoryEntries = Array.isArray(invRaw) ? invRaw : invRaw ? [invRaw] : [];
+    // -----------------------------
+    // Inventory items
+    // -----------------------------
+    const invRaw = v["ALLINVENTORYENTRIES.LIST"];
+    const inventoryEntries = Array.isArray(invRaw)
+      ? invRaw
+      : invRaw
+      ? [invRaw]
+      : [];
 
     const items = inventoryEntries.map((i) => ({
-      itemName: getVal(i, 'STOCKITEMNAME') || null,
-      quantity: getVal(i, 'BILLEDQTY') || null,
-      rate: getVal(i, 'RATE') || null,
-      amount: Number(getVal(i, 'AMOUNT') || 0),
+      itemName: getVal(i, "STOCKITEMNAME") || null,
+      quantity: getVal(i, "BILLEDQTY") || null,
+      rate: getVal(i, "RATE") || null,
+      amount: Number(getVal(i, "AMOUNT") || 0),
     }));
+
+    const invoiceStatus =
+      outstandingAmount === 0
+        ? "PAID"
+        : outstandingAmount < totalAmount
+        ? "PARTIALLY_PAID"
+
+        : "UNPAID";
+    console.log(
+      "FINAL CUSTOMER:",
+      customerName,
+      "Invoice:",
+      invoiceNo
+    );
 
     invoices.push({
       source: "TALLY",
@@ -447,8 +470,6 @@ function sendInvoicesToBackend(invoices) {
       outstandingAmount,
       tdsAmount: tdsAmount || null,
       tcsAmount: tcsAmount || null,
-      creditPeriodDays,
-      dueDate,
       invoiceStatus,
       items,
       lastSyncedAt: new Date().toISOString(),
@@ -457,3 +478,60 @@ function sendInvoicesToBackend(invoices) {
 
   return invoices;
 }
+
+
+  // Print all extracted customer names for debug
+  
+
+// -----------------------------
+// Multi-method sync: LIVE | FOLDER
+// -----------------------------
+const SYNC_METHODS = { LIVE: 'LIVE', FOLDER: 'FOLDER' };
+let selectedSyncMethod = null;
+
+ipcMain.handle('set-sync-method', async (event, data) => {
+  const m = (data?.method || '').toString().toUpperCase();
+  if (!Object.values(SYNC_METHODS).includes(m)) {
+    return { status: 'error', message: 'Invalid sync method' };
+  }
+  selectedSyncMethod = m;
+  return { status: 'ok', method: selectedSyncMethod };
+});
+
+ipcMain.handle('start-sync', async () => {
+  if (!selectedSyncMethod) return { status: 'error', message: 'No sync method selected' };
+
+  if (selectedSyncMethod === SYNC_METHODS.LIVE) {
+    if (!currentIdToken) return { status: 'error', message: 'Please login first' };
+    try {
+      const xml = await fetchSalesVouchersFromTally();
+      const invoices = extractInvoicesFromTallyXML(xml);
+      
+      if (invoices.length === 0) {
+        return { status: 'warning', message: 'No Sales invoices found', count: 0 };
+      }
+      
+      await sendInvoicesToBackend(invoices);
+      return { status: 'ok', method: SYNC_METHODS.LIVE, count: invoices.length };
+    } catch (err) {
+      console.error('LIVE sync error:', err && err.message);
+      
+      // User-friendly errors
+      let msg = err && err.message;
+      if (msg && msg.includes('ECONNREFUSED')) {
+        msg = 'Cannot connect to Tally. Is Tally Prime running?';
+      }
+      return { status: 'error', message: msg };
+    }
+  }
+
+  if (selectedSyncMethod === SYNC_METHODS.FOLDER) {
+    return { status: 'ok', method: SYNC_METHODS.FOLDER, message: 'Folder watching started. Drop XML files in C:\\Giropie\\Imports' };
+  }
+
+  return { status: 'error', message: 'Unsupported sync method' };
+});
+
+ipcMain.handle('stop-folder-import', async () => {
+  return { status: 'ok', stopped: true };
+});

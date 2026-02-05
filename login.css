@@ -1,0 +1,6 @@
+/* login.css - Additional login screen styles */
+#screen-login .form-row input:focus + label,
+#screen-login .form-row input:not(:placeholder-shown) + label {
+  transform: translateY(-20px) scale(0.85);
+}
+

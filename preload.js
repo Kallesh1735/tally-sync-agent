@@ -4,8 +4,14 @@
 const { contextBridge, ipcRenderer } = require('electron');
 
 contextBridge.exposeInMainWorld('electronAPI', {
-  // Calls the main process and returns a promise with the response
-  syncFromTally: () => ipcRenderer.invoke('sync-from-tally'),
-  // Send login request (email/password) to main process. Returns a promise.
-  login: (email, password) => ipcRenderer.invoke('login', { email, password })
+  // Login
+  login: (email, password) => ipcRenderer.invoke('login', { email, password }),
+  // Set sync method (LIVE or FOLDER)
+  setSyncMethod: (method) => ipcRenderer.invoke('set-sync-method', { method }),
+  // Start sync (uses chosen method)
+  startSync: () => ipcRenderer.invoke('start-sync'),
+  // Stop folder watcher
+  stopFolderImport: () => ipcRenderer.invoke('stop-folder-import'),
+  // Legacy sync (still works)
+  syncFromTally: () => ipcRenderer.invoke('sync-from-tally')
 });
