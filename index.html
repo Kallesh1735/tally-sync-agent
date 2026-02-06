@@ -8,7 +8,6 @@
   </head>
   <body>
     <div class="container">
-      
       <!-- Header -->
       <header class="header">
         <h1>GIROPie Tally Agent</h1>
@@ -18,6 +17,21 @@
       <!-- Screen 1: Login -->
       <div id="screen-login" class="screen">
         <div class="card">
+          <div class="brand-flow" aria-hidden="true">
+            <div class="brand-pill tally">
+              <span class="brand-icon">&#128196;</span>
+              <span class="brand-text">Tally</span>
+            </div>
+            <div class="brand-bridge">
+              <span class="flow-dot"></span>
+              <span class="flow-line"></span>
+              <span class="flow-arrow">&#10132;</span>
+            </div>
+            <div class="brand-pill giropie">
+              <span class="brand-icon">&#128200;</span>
+              <span class="brand-text">Giropie</span>
+            </div>
+          </div>
           <h2>Login</h2>
           <input id="email" type="email" placeholder="Email" class="input" />
           <input id="password" type="password" placeholder="Password" class="input" />
@@ -32,14 +46,18 @@
           <h2>Choose Sync Method</h2>
           <div class="method-cards">
             <button id="method-live" class="method-card">
-              <span class="method-icon">⚡</span>
-              <span class="method-title">Live Sync</span>
-              <span class="method-desc">Connect directly to Tally</span>
+              <span class="method-icon live">&#9889;</span>
+              <div class="method-text">
+                <span class="method-title">Live Sync</span>
+                <span class="method-desc">Connect directly to Tally</span>
+              </div>
             </button>
             <button id="method-folder" class="method-card">
-              <span class="method-icon">📁</span>
-              <span class="method-title">Folder Import</span>
-              <span class="method-desc">Watch folder for XML files</span>
+              <span class="method-icon folder">&#128193;</span>
+              <div class="method-text">
+                <span class="method-title">Folder Import</span>
+                <span class="method-desc">Watch folder for XML files</span>
+              </div>
             </button>
           </div>
           <button id="method-back-to-login" class="btn btn-secondary">Back</button>
@@ -51,11 +69,13 @@
         <div class="card">
           <h2>Sync: <span id="selectedMethodText"></span></h2>
           <div class="sync-visual">
-            <div class="sync-icon">🔄</div>
+            <div class="sync-icon">&#128260;</div>
           </div>
           <div id="syncMsg" class="msg"></div>
-          <button id="startSyncBtn" class="btn btn-primary">Start Sync</button>
-          <button id="changeMethodBtn" class="btn btn-secondary">Change Method</button>
+          <div class="sync-actions">
+            <button id="startSyncBtn" class="btn btn-primary">Start Sync</button>
+            <button id="changeMethodBtn" class="btn btn-secondary">Change Method</button>
+          </div>
         </div>
       </div>
 
@@ -63,7 +83,6 @@
       <footer class="footer">
         <p>v1.0.0 | <a href="https://giropie.com" target="_blank">giropie.com</a></p>
       </footer>
-
     </div>
     <script src="renderer.js"></script>
   </body>
