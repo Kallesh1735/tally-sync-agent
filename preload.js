@@ -13,5 +13,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // Stop folder watcher
   stopFolderImport: () => ipcRenderer.invoke('stop-folder-import'),
   // Legacy sync (still works)
-  syncFromTally: () => ipcRenderer.invoke('sync-from-tally')
+  syncFromTally: () => ipcRenderer.invoke('sync-from-tally'),
+  // UI helpers
+  getAuthStatus: () => ipcRenderer.invoke('get-auth-status'),
+  getLastSyncSummary: () => ipcRenderer.invoke('get-last-sync-summary'),
+  // Logout
+  logout: () => ipcRenderer.invoke('logout')
 });

@@ -174,8 +174,23 @@ a:hover {
   border-color: rgba(14, 165, 164, 0.5);
 }
 
-.brand-icon {
-  font-size: 1.1rem;
+.brand-logo-wrap {
+  width: 44px;
+  height: 44px;
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.96);
+  display: grid;
+  place-items: center;
+  box-shadow:
+    inset 0 0 0 1px rgba(15, 23, 42, 0.08),
+    0 8px 16px rgba(2, 6, 23, 0.18);
+}
+
+.brand-logo {
+  width: 32px;
+  height: 32px;
+  object-fit: contain;
+  image-rendering: auto;
 }
 
 .brand-bridge {
@@ -344,9 +359,7 @@ a:hover {
   border-radius: 14px;
   display: grid;
   place-items: center;
-  font-size: 1.35rem;
-  color: #081018;
-  font-weight: 700;
+  color: #f8fafc;
 }
 
 .method-icon.live {
@@ -355,6 +368,12 @@ a:hover {
 
 .method-icon.folder {
   background: linear-gradient(135deg, #38bdf8, #0ea5a4);
+}
+
+.method-svg {
+  width: 26px;
+  height: 26px;
+  fill: currentColor;
 }
 
 .method-title {
@@ -387,6 +406,35 @@ a:hover {
   animation: spin 4s linear infinite;
 }
 
+#companyHint.msg {
+  margin: 2px auto 16px;
+  max-width: 320px;
+}
+
+.sync-summary {
+  margin: 10px auto 6px;
+  padding: 12px 14px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: rgba(15, 23, 42, 0.6);
+  font-size: 0.85rem;
+  color: var(--text-2);
+  max-width: 320px;
+  text-align: left;
+}
+
+.summary-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 4px 0;
+}
+
+.summary-row span:last-child {
+  color: var(--text-1);
+  font-weight: 600;
+}
+
 #screen-sync .card {
   text-align: center;
 }
@@ -405,6 +453,11 @@ a:hover {
 
 .sync-actions .btn {
   width: 100%;
+}
+
+.logout-btn {
+  width: 100%;
+  margin-top: 10px;
 }
 
 /* Footer */

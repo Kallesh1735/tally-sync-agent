@@ -19,7 +19,9 @@
         <div class="card">
           <div class="brand-flow" aria-hidden="true">
             <div class="brand-pill tally">
-              <span class="brand-icon">&#128196;</span>
+              <span class="brand-logo-wrap">
+                <img class="brand-logo" src="assets/tally-prime-logo.png" alt="Tally" />
+              </span>
               <span class="brand-text">Tally</span>
             </div>
             <div class="brand-bridge">
@@ -28,10 +30,13 @@
               <span class="flow-arrow">&#10132;</span>
             </div>
             <div class="brand-pill giropie">
-              <span class="brand-icon">&#128200;</span>
+              <span class="brand-logo-wrap">
+                <img class="brand-logo" src="assets/giropie-logo.png" alt="Giropie" />
+              </span>
               <span class="brand-text">Giropie</span>
             </div>
           </div>
+          <div id="companyHint" class="msg msg-warning"></div>
           <h2>Login</h2>
           <input id="email" type="email" placeholder="Email" class="input" />
           <input id="password" type="password" placeholder="Password" class="input" />
@@ -46,14 +51,22 @@
           <h2>Choose Sync Method</h2>
           <div class="method-cards">
             <button id="method-live" class="method-card">
-              <span class="method-icon live">&#9889;</span>
+              <span class="method-icon live" aria-hidden="true">
+                <svg class="method-svg" viewBox="0 0 24 24" role="img">
+                  <path d="M13.5 2L4 13h6l-1.5 9L20 11h-6l-0.5-9z" />
+                </svg>
+              </span>
               <div class="method-text">
                 <span class="method-title">Live Sync</span>
                 <span class="method-desc">Connect directly to Tally</span>
               </div>
             </button>
             <button id="method-folder" class="method-card">
-              <span class="method-icon folder">&#128193;</span>
+              <span class="method-icon folder" aria-hidden="true">
+                <svg class="method-svg" viewBox="0 0 24 24" role="img">
+                  <path d="M3 6.5A2.5 2.5 0 0 1 5.5 4h4.2l1.6 1.6H18.5A2.5 2.5 0 0 1 21 8.1V18a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V6.5z" />
+                </svg>
+              </span>
               <div class="method-text">
                 <span class="method-title">Folder Import</span>
                 <span class="method-desc">Watch folder for XML files</span>
@@ -71,11 +84,26 @@
           <div class="sync-visual">
             <div class="sync-icon">&#128260;</div>
           </div>
+          <div class="sync-summary">
+            <div class="summary-row">
+              <span>Last sync</span>
+              <span id="lastSyncStatus">—</span>
+            </div>
+            <div class="summary-row">
+              <span>Last payload</span>
+              <span id="lastPayloadCount">—</span>
+            </div>
+            <div class="summary-row">
+              <span>Total amount</span>
+              <span id="lastTotalAmount">—</span>
+            </div>
+          </div>
           <div id="syncMsg" class="msg"></div>
           <div class="sync-actions">
             <button id="startSyncBtn" class="btn btn-primary">Start Sync</button>
             <button id="changeMethodBtn" class="btn btn-secondary">Change Method</button>
           </div>
+          <button id="logoutBtn" class="btn btn-secondary logout-btn">Logout</button>
         </div>
       </div>
 

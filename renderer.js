@@ -22,11 +22,65 @@ document.addEventListener('DOMContentLoaded', () => {
   const startSyncBtn = document.getElementById('startSyncBtn');
   const changeMethodBtn = document.getElementById('changeMethodBtn');
   const syncMsg = document.getElementById('syncMsg');
+  const companyHint = document.getElementById('companyHint');
+  const logoutBtn = document.getElementById('logoutBtn');
+
+  const lastSyncStatus = document.getElementById('lastSyncStatus');
+  const lastPayloadCount = document.getElementById('lastPayloadCount');
+  const lastTotalAmount = document.getElementById('lastTotalAmount');
 
   let chosenMethod = null;
 
   // Initial view
   showScreen('screen-login');
+
+  function refreshAuthHint() {
+    if (!companyHint) return;
+    companyHint.textContent = '';
+    companyHint.className = 'msg';
+  }
+
+  async function refreshLastSyncSummary() {
+    if (!lastSyncStatus || !lastPayloadCount || !lastTotalAmount) return;
+    try {
+      const summary = await window.electronAPI.getLastSyncSummary();
+      if (!summary || !summary.available) {
+        lastSyncStatus.textContent = '—';
+        lastPayloadCount.textContent = '—';
+        lastTotalAmount.textContent = '—';
+        return;
+      }
+
+      if (summary.lastEvent === 'backend_success') {
+        lastSyncStatus.textContent = 'Success';
+      } else if (summary.lastEvent === 'sync_error') {
+        lastSyncStatus.textContent = 'Error';
+      } else {
+        lastSyncStatus.textContent = 'Unknown';
+      }
+
+      if (typeof summary.previewCount === 'number') {
+        lastPayloadCount.textContent = `${summary.previewCount} invoice(s)`;
+      } else if (typeof summary.invoiceCount === 'number') {
+        lastPayloadCount.textContent = `${summary.invoiceCount} invoice(s)`;
+      } else {
+        lastPayloadCount.textContent = '—';
+      }
+
+      if (typeof summary.totalAmountSum === 'number') {
+        lastTotalAmount.textContent = summary.totalAmountSum.toFixed(2);
+      } else {
+        lastTotalAmount.textContent = '—';
+      }
+    } catch (err) {
+      lastSyncStatus.textContent = '—';
+      lastPayloadCount.textContent = '—';
+      lastTotalAmount.textContent = '—';
+    }
+  }
+
+  refreshAuthHint();
+  refreshLastSyncSummary();
 
   // Login
   if (loginBtn) {
@@ -40,6 +94,7 @@ document.addEventListener('DOMContentLoaded', () => {
         if (res && res.status === 'ok') {
           loginMsg.className = 'msg msg-success';
           loginMsg.textContent = 'Login successful!';
+          refreshAuthHint();
           setTimeout(() => showScreen('screen-method'), 500);
         } else {
           loginMsg.className = 'msg msg-error';
@@ -63,6 +118,7 @@ document.addEventListener('DOMContentLoaded', () => {
         syncMsg.textContent = '';
         syncMsg.className = 'msg';
         showScreen('screen-sync');
+        refreshLastSyncSummary();
       } else {
         alert((res && res.message) || 'Failed to set method');
       }
@@ -78,6 +134,7 @@ document.addEventListener('DOMContentLoaded', () => {
         syncMsg.textContent = '';
         syncMsg.className = 'msg';
         showScreen('screen-sync');
+        refreshLastSyncSummary();
       } else {
         alert((res && res.message) || 'Failed to set method');
       }
@@ -118,6 +175,7 @@ document.addEventListener('DOMContentLoaded', () => {
       } finally {
         startSyncBtn.disabled = false;
         startSyncBtn.textContent = 'Start Sync';
+        await refreshLastSyncSummary();
       }
     });
   }
@@ -131,6 +189,29 @@ document.addEventListener('DOMContentLoaded', () => {
       selectedMethodText.textContent = '';
       syncMsg.textContent = '';
       showScreen('screen-method');
+    });
+  }
+
+  if (logoutBtn) {
+    logoutBtn.addEventListener('click', async () => {
+      logoutBtn.disabled = true;
+      logoutBtn.textContent = 'Logging out...';
+      try {
+        await window.electronAPI.logout();
+      } catch (err) {
+        console.error('Logout IPC error:', err);
+      } finally {
+        logoutBtn.disabled = false;
+        logoutBtn.textContent = 'Logout';
+      }
+
+      chosenMethod = null;
+      selectedMethodText.textContent = '';
+      syncMsg.textContent = '';
+      syncMsg.className = 'msg';
+      showScreen('screen-login');
+      refreshAuthHint();
+      refreshLastSyncSummary();
     });
   }
 });
