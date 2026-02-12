@@ -9,7 +9,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // Set sync method (LIVE or FOLDER)
   setSyncMethod: (method) => ipcRenderer.invoke('set-sync-method', { method }),
   // Start sync (uses chosen method)
-  startSync: () => ipcRenderer.invoke('start-sync'),
+  startSync: (options) => ipcRenderer.invoke('start-sync', options),
   // Stop folder watcher
   stopFolderImport: () => ipcRenderer.invoke('stop-folder-import'),
   // Legacy sync (still works)

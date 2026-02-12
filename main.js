@@ -39,20 +39,6 @@ if (!firebase.apps.length) {
   console.log("Firebase initialized in main process");
 }
 
-console.log(
-  "Timeouts:",
-  `TALLY_TIMEOUT_MS=${TALLY_REQUEST_TIMEOUT_MS}`,
-  `BACKEND_TIMEOUT_MS=${BACKEND_REQUEST_TIMEOUT_MS}`,
-  `TALLY_RETRY_COUNT=${TALLY_REQUEST_RETRIES}`,
-  `TALLY_RETRY_DELAY_MS=${TALLY_RETRY_DELAY_MS}`
-);
-console.log(
-  "Sync window:",
-  `SYNC_MODE=${SYNC_MODE}`,
-  `SYNC_LOOKBACK_DAYS=${SYNC_LOOKBACK_DAYS}`,
-  `SYNC_OVERLAP_DAYS=${SYNC_OVERLAP_DAYS}`
-);
-
 // -----------------------------
 // Auth state
 // -----------------------------
@@ -72,7 +58,23 @@ const TALLY_RETRY_DELAY_MS = Number(process.env.TALLY_RETRY_DELAY_MS || 1500);
 const SYNC_MODE = (process.env.SYNC_MODE || "incremental").toLowerCase();
 const SYNC_LOOKBACK_DAYS = Number(process.env.SYNC_LOOKBACK_DAYS || 30);
 const SYNC_OVERLAP_DAYS = Number(process.env.SYNC_OVERLAP_DAYS || 1);
+const SYNC_FULL_LOOKBACK_DAYS = Number(process.env.SYNC_FULL_LOOKBACK_DAYS || 365);
 const lastSyncFilePath = path.join(app.getPath("userData"), "lastSync.json");
+
+console.log(
+  "Timeouts:",
+  `TALLY_TIMEOUT_MS=${TALLY_REQUEST_TIMEOUT_MS}`,
+  `BACKEND_TIMEOUT_MS=${BACKEND_REQUEST_TIMEOUT_MS}`,
+  `TALLY_RETRY_COUNT=${TALLY_REQUEST_RETRIES}`,
+  `TALLY_RETRY_DELAY_MS=${TALLY_RETRY_DELAY_MS}`
+);
+console.log(
+  "Sync window:",
+  `SYNC_MODE=${SYNC_MODE}`,
+  `SYNC_LOOKBACK_DAYS=${SYNC_LOOKBACK_DAYS}`,
+  `SYNC_OVERLAP_DAYS=${SYNC_OVERLAP_DAYS}`,
+  `SYNC_FULL_LOOKBACK_DAYS=${SYNC_FULL_LOOKBACK_DAYS}`
+);
 
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -102,7 +104,8 @@ function saveLastSyncAt(isoString) {
   }
 }
 
-function computeSyncWindow() {
+function computeSyncWindow(options = {}) {
+  const modeOverride = options.modeOverride || null;
   const now = new Date();
   const lastSyncState = loadLastSyncState();
   const lastSyncAt =
@@ -111,6 +114,18 @@ function computeSyncWindow() {
     (!lastSyncState.uid || lastSyncState.uid === currentUserUid)
       ? new Date(lastSyncState.lastSyncAt)
       : null;
+
+  if (modeOverride === "full") {
+    const fromDate = new Date(now);
+    fromDate.setDate(fromDate.getDate() - SYNC_FULL_LOOKBACK_DAYS);
+    return {
+      mode: "full",
+      fromDate,
+      toDate: now,
+      lookbackDays: SYNC_FULL_LOOKBACK_DAYS,
+      lastSyncAt: lastSyncState ? lastSyncState.lastSyncAt : null,
+    };
+  }
 
   if (SYNC_MODE === "incremental" && lastSyncAt && !isNaN(lastSyncAt.getTime())) {
     const fromDate = new Date(lastSyncAt);
@@ -544,7 +559,7 @@ ipcMain.handle("login", async (event, creds) => {
 // -----------------------------
 // Fetch Sales Vouchers (Invoices) from Tally
 // -----------------------------
-function fetchSalesVouchersFromTally() {
+function fetchSalesVouchersFromTally(options = {}) {
   return new Promise((resolve, reject) => {
     // Build a reasonable default date range (last 30 days) to avoid empty future ranges
     const formatYMD = (d) => {
@@ -554,7 +569,9 @@ function fetchSalesVouchersFromTally() {
       return `${y}${m}${day}`;
     };
 
-    const syncWindow = computeSyncWindow();
+    const syncWindow = computeSyncWindow({
+      modeOverride: options.modeOverride || null,
+    });
     const SVFROMDATE = formatYMD(syncWindow.fromDate);
     const SVTODATE = formatYMD(syncWindow.toDate);
 
@@ -1080,10 +1097,11 @@ ipcMain.handle('set-sync-method', async (event, data) => {
   return { status: 'ok', method: selectedSyncMethod };
 });
 
-ipcMain.handle('start-sync', async () => {
+ipcMain.handle('start-sync', async (event, data) => {
   if (!selectedSyncMethod) return { status: 'error', message: 'No sync method selected' };
 
   if (selectedSyncMethod === SYNC_METHODS.LIVE) {
+    const isFullSync = Boolean(data && data.forceFullSync);
     const syncId = createSyncId();
     writeSyncLog({
       ts: new Date().toISOString(),
@@ -1091,13 +1109,16 @@ ipcMain.handle('start-sync', async () => {
       event: "sync_start",
       syncId,
       method: "LIVE",
+      mode: isFullSync ? "full" : "incremental",
     });
 
     try {
       await ensureFreshIdToken();
       const companyId = resolveCompanyId();
 
-      const tallyResult = await fetchSalesVouchersFromTally();
+      const tallyResult = await fetchSalesVouchersFromTally({
+        modeOverride: isFullSync ? "full" : null,
+      });
       const xml = tallyResult.xml || "";
       const meta = tallyResult.meta || {};
       const { invoices, stats } = extractInvoicesFromTallyXML(xml, {

@@ -455,6 +455,10 @@ a:hover {
   width: 100%;
 }
 
+.full-sync-btn {
+  grid-column: 1 / -1;
+}
+
 .logout-btn {
   width: 100%;
   margin-top: 10px;

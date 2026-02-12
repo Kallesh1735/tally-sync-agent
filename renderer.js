@@ -24,8 +24,10 @@ document.addEventListener('DOMContentLoaded', () => {
   const syncMsg = document.getElementById('syncMsg');
   const companyHint = document.getElementById('companyHint');
   const logoutBtn = document.getElementById('logoutBtn');
+  const fullSyncBtn = document.getElementById('fullSyncBtn');
 
   const lastSyncStatus = document.getElementById('lastSyncStatus');
+  const lastSyncAt = document.getElementById('lastSyncAt');
   const lastPayloadCount = document.getElementById('lastPayloadCount');
   const lastTotalAmount = document.getElementById('lastTotalAmount');
 
@@ -41,13 +43,14 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   async function refreshLastSyncSummary() {
-    if (!lastSyncStatus || !lastPayloadCount || !lastTotalAmount) return;
+    if (!lastSyncStatus || !lastPayloadCount || !lastTotalAmount || !lastSyncAt) return;
     try {
       const summary = await window.electronAPI.getLastSyncSummary();
       if (!summary || !summary.available) {
-        lastSyncStatus.textContent = '—';
-        lastPayloadCount.textContent = '—';
-        lastTotalAmount.textContent = '—';
+        lastSyncStatus.textContent = '-';
+        lastSyncAt.textContent = '-';
+        lastPayloadCount.textContent = '-';
+        lastTotalAmount.textContent = '-';
         return;
       }
 
@@ -64,18 +67,28 @@ document.addEventListener('DOMContentLoaded', () => {
       } else if (typeof summary.invoiceCount === 'number') {
         lastPayloadCount.textContent = `${summary.invoiceCount} invoice(s)`;
       } else {
-        lastPayloadCount.textContent = '—';
+        lastPayloadCount.textContent = '-';
+      }
+
+      if (summary.lastAt) {
+        const dt = new Date(summary.lastAt);
+        lastSyncAt.textContent = isNaN(dt.getTime())
+          ? '-'
+          : dt.toLocaleString();
+      } else {
+        lastSyncAt.textContent = '-';
       }
 
       if (typeof summary.totalAmountSum === 'number') {
         lastTotalAmount.textContent = summary.totalAmountSum.toFixed(2);
       } else {
-        lastTotalAmount.textContent = '—';
+        lastTotalAmount.textContent = '-';
       }
     } catch (err) {
-      lastSyncStatus.textContent = '—';
-      lastPayloadCount.textContent = '—';
-      lastTotalAmount.textContent = '—';
+      lastSyncStatus.textContent = '-';
+      lastSyncAt.textContent = '-';
+      lastPayloadCount.textContent = '-';
+      lastTotalAmount.textContent = '-';
     }
   }
 
@@ -152,6 +165,7 @@ document.addEventListener('DOMContentLoaded', () => {
     startSyncBtn.addEventListener('click', async () => {
       startSyncBtn.disabled = true;
       startSyncBtn.textContent = 'Syncing...';
+      if (fullSyncBtn) fullSyncBtn.disabled = true;
       syncMsg.className = 'msg';
       syncMsg.textContent = 'Connecting...';
       
@@ -175,6 +189,41 @@ document.addEventListener('DOMContentLoaded', () => {
       } finally {
         startSyncBtn.disabled = false;
         startSyncBtn.textContent = 'Start Sync';
+        if (fullSyncBtn) fullSyncBtn.disabled = false;
+        await refreshLastSyncSummary();
+      }
+    });
+  }
+
+  if (fullSyncBtn) {
+    fullSyncBtn.addEventListener('click', async () => {
+      fullSyncBtn.disabled = true;
+      fullSyncBtn.textContent = 'Full Syncing...';
+      if (startSyncBtn) startSyncBtn.disabled = true;
+      syncMsg.className = 'msg';
+      syncMsg.textContent = 'Connecting...';
+
+      try {
+        const res = await window.electronAPI.startSync({ forceFullSync: true });
+
+        if (res && res.status === 'ok') {
+          syncMsg.className = 'msg msg-success';
+          syncMsg.textContent = res.message || `Synced ${res.count || 0} invoice(s)`;
+        } else if (res && res.status === 'warning') {
+          syncMsg.className = 'msg msg-warning';
+          syncMsg.textContent = res.message || 'Sync warning';
+        } else {
+          syncMsg.className = 'msg msg-error';
+          syncMsg.textContent = res?.message || 'Sync failed';
+        }
+      } catch (err) {
+        syncMsg.className = 'msg msg-error';
+        syncMsg.textContent = 'Connection error';
+        console.error('fullSync IPC error:', err);
+      } finally {
+        fullSyncBtn.disabled = false;
+        fullSyncBtn.textContent = 'Full Sync';
+        if (startSyncBtn) startSyncBtn.disabled = false;
         await refreshLastSyncSummary();
       }
     });
