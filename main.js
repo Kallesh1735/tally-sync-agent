@@ -59,6 +59,7 @@ const SYNC_MODE = (process.env.SYNC_MODE || "incremental").toLowerCase();
 const SYNC_LOOKBACK_DAYS = Number(process.env.SYNC_LOOKBACK_DAYS || 30);
 const SYNC_OVERLAP_DAYS = Number(process.env.SYNC_OVERLAP_DAYS || 1);
 const SYNC_FULL_LOOKBACK_DAYS = Number(process.env.SYNC_FULL_LOOKBACK_DAYS || 365);
+const SYNC_FUTURE_BUFFER_DAYS = Number(process.env.SYNC_FUTURE_BUFFER_DAYS || 0);
 const lastSyncFilePath = path.join(app.getPath("userData"), "lastSync.json");
 
 console.log(
@@ -73,47 +74,130 @@ console.log(
   `SYNC_MODE=${SYNC_MODE}`,
   `SYNC_LOOKBACK_DAYS=${SYNC_LOOKBACK_DAYS}`,
   `SYNC_OVERLAP_DAYS=${SYNC_OVERLAP_DAYS}`,
-  `SYNC_FULL_LOOKBACK_DAYS=${SYNC_FULL_LOOKBACK_DAYS}`
+  `SYNC_FULL_LOOKBACK_DAYS=${SYNC_FULL_LOOKBACK_DAYS}`,
+  `SYNC_FUTURE_BUFFER_DAYS=${SYNC_FUTURE_BUFFER_DAYS}`
 );
 
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function loadLastSyncState() {
+function formatYMDDate(d) {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}${m}${day}`;
+}
+
+function normalizeCompanyName(value) {
+  if (!value || typeof value !== "string") return null;
+  const normalized = value.trim().replace(/\s+/g, " ");
+  return normalized.length ? normalized : null;
+}
+
+function lastSyncKey(uid, companyName) {
+  const user = uid || "anonymous";
+  const company = (normalizeCompanyName(companyName) || "AUTO").toUpperCase();
+  return `${user}::${company}`;
+}
+
+function normalizeLastSyncStore(raw) {
+  if (!raw || typeof raw !== "object") {
+    return { version: 2, byKey: {}, lastCompanyByUid: {} };
+  }
+
+  if (raw.version === 2 && raw.byKey && typeof raw.byKey === "object") {
+    return {
+      version: 2,
+      byKey: raw.byKey,
+      lastCompanyByUid:
+        raw.lastCompanyByUid && typeof raw.lastCompanyByUid === "object"
+          ? raw.lastCompanyByUid
+          : {},
+    };
+  }
+
+  // Backward compatibility with older single-entry format
+  if (raw.lastSyncAt) {
+    const key = lastSyncKey(raw.uid || null, raw.companyName || null);
+    return {
+      version: 2,
+      byKey: {
+        [key]: {
+          lastSyncAt: raw.lastSyncAt,
+          savedAt: raw.savedAt || null,
+          companyName: normalizeCompanyName(raw.companyName),
+        },
+      },
+      lastCompanyByUid: {},
+    };
+  }
+
+  return { version: 2, byKey: {}, lastCompanyByUid: {} };
+}
+
+function loadLastSyncStore() {
   try {
-    if (!fs.existsSync(lastSyncFilePath)) return null;
+    if (!fs.existsSync(lastSyncFilePath)) {
+      return normalizeLastSyncStore(null);
+    }
     const raw = fs.readFileSync(lastSyncFilePath, "utf-8");
-    const data = JSON.parse(raw);
-    return data && typeof data === "object" ? data : null;
+    return normalizeLastSyncStore(JSON.parse(raw));
   } catch (err) {
-    return null;
+    return normalizeLastSyncStore(null);
   }
 }
 
-function saveLastSyncAt(isoString) {
+function saveLastSyncStore(store) {
   try {
-    const payload = {
-      uid: currentUserUid || null,
-      lastSyncAt: isoString,
-      savedAt: new Date().toISOString(),
-    };
-    fs.writeFileSync(lastSyncFilePath, JSON.stringify(payload, null, 2), "utf-8");
+    fs.writeFileSync(
+      lastSyncFilePath,
+      JSON.stringify(store, null, 2),
+      "utf-8"
+    );
   } catch (err) {
-    console.error("Failed to save last sync time:", err.message);
+    console.error("Failed to save last sync store:", err.message);
   }
+}
+
+function resolveTallyCompanyHint() {
+  const envCompany = normalizeCompanyName(process.env.TALLY_COMPANY || "");
+  if (envCompany) return envCompany;
+
+  const store = loadLastSyncStore();
+  const uid = currentUserUid || null;
+  if (!uid) return null;
+  return normalizeCompanyName(store.lastCompanyByUid[uid] || null);
+}
+
+function saveLastSyncAt(isoString, options = {}) {
+  const companyName = normalizeCompanyName(options.companyName || null);
+  const store = loadLastSyncStore();
+  const uid = currentUserUid || null;
+  const key = lastSyncKey(uid, companyName);
+  store.byKey[key] = {
+    lastSyncAt: isoString,
+    savedAt: new Date().toISOString(),
+    companyName,
+  };
+  if (uid && companyName) {
+    store.lastCompanyByUid[uid] = companyName;
+  }
+  saveLastSyncStore(store);
 }
 
 function computeSyncWindow(options = {}) {
   const modeOverride = options.modeOverride || null;
+  const companyName = normalizeCompanyName(options.companyName || null);
   const now = new Date();
-  const lastSyncState = loadLastSyncState();
-  const lastSyncAt =
-    lastSyncState &&
-    lastSyncState.lastSyncAt &&
-    (!lastSyncState.uid || lastSyncState.uid === currentUserUid)
-      ? new Date(lastSyncState.lastSyncAt)
-      : null;
+  if (SYNC_FUTURE_BUFFER_DAYS > 0) {
+    now.setDate(now.getDate() + SYNC_FUTURE_BUFFER_DAYS);
+  }
+
+  const store = loadLastSyncStore();
+  const key = lastSyncKey(currentUserUid || null, companyName);
+  const entry = store.byKey[key] || null;
+  const lastSyncAt = entry && entry.lastSyncAt ? new Date(entry.lastSyncAt) : null;
 
   if (modeOverride === "full") {
     const fromDate = new Date(now);
@@ -123,7 +207,9 @@ function computeSyncWindow(options = {}) {
       fromDate,
       toDate: now,
       lookbackDays: SYNC_FULL_LOOKBACK_DAYS,
-      lastSyncAt: lastSyncState ? lastSyncState.lastSyncAt : null,
+      lastSyncAt: entry ? entry.lastSyncAt : null,
+      checkpointKey: key,
+      checkpointCompany: companyName || "AUTO",
     };
   }
 
@@ -134,8 +220,10 @@ function computeSyncWindow(options = {}) {
       mode: "incremental",
       fromDate,
       toDate: now,
-      lastSyncAt: lastSyncState.lastSyncAt,
+      lastSyncAt: entry.lastSyncAt,
       overlapDays: SYNC_OVERLAP_DAYS,
+      checkpointKey: key,
+      checkpointCompany: companyName || "AUTO",
     };
   }
 
@@ -146,7 +234,54 @@ function computeSyncWindow(options = {}) {
     fromDate,
     toDate: now,
     lookbackDays: SYNC_LOOKBACK_DAYS,
-    lastSyncAt: lastSyncState ? lastSyncState.lastSyncAt : null,
+    lastSyncAt: entry ? entry.lastSyncAt : null,
+    checkpointKey: key,
+    checkpointCompany: companyName || "AUTO",
+  };
+}
+
+function escapeXml(value) {
+  return String(value)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
+}
+
+function detectCompanyNameFromTallyXml(xml) {
+  if (!xml || typeof xml !== "string") return null;
+  const patterns = [
+    /<SVCURRENTCOMPANY>([^<]+)<\/SVCURRENTCOMPANY>/i,
+    /<COMPANYNAME>([^<]+)<\/COMPANYNAME>/i,
+    /<CMPNAME>([^<]+)<\/CMPNAME>/i,
+  ];
+  for (const pattern of patterns) {
+    const match = xml.match(pattern);
+    if (match && match[1]) {
+      return normalizeCompanyName(match[1]);
+    }
+  }
+  return null;
+}
+
+function getSyncWindowPreview(options = {}) {
+  const isFullSync = Boolean(options.forceFullSync);
+  const companyHint = resolveTallyCompanyHint();
+  const syncWindow = computeSyncWindow({
+    modeOverride: isFullSync ? "full" : null,
+    companyName: companyHint,
+  });
+  return {
+    mode: syncWindow.mode,
+    fromDate: formatYMDDate(syncWindow.fromDate),
+    toDate: formatYMDDate(syncWindow.toDate),
+    lastSyncAt: syncWindow.lastSyncAt || null,
+    checkpointCompany: syncWindow.checkpointCompany || null,
+    lookbackDays: syncWindow.lookbackDays || null,
+    overlapDays: syncWindow.overlapDays || null,
+    futureBufferDays: SYNC_FUTURE_BUFFER_DAYS,
+    companyHint: companyHint || null,
   };
 }
 
@@ -569,19 +704,25 @@ function fetchSalesVouchersFromTally(options = {}) {
       return `${y}${m}${day}`;
     };
 
+    const companyHint = normalizeCompanyName(options.companyHint || null);
+    const envCompany = normalizeCompanyName(process.env.TALLY_COMPANY || null);
+    const companyName = envCompany || companyHint || null;
+
     const syncWindow = computeSyncWindow({
       modeOverride: options.modeOverride || null,
+      companyName,
     });
     const SVFROMDATE = formatYMD(syncWindow.fromDate);
     const SVTODATE = formatYMD(syncWindow.toDate);
 
-    // Allow overriding company name via env var when debugging; default to existing value
-    const companyName = process.env.TALLY_COMPANY || "Giropie Pvt and Ltd";
-
     console.log("Date range:", SVFROMDATE, "to", SVTODATE);
-    console.log("Company:", companyName);
+    console.log("Company hint:", companyName || "AUTO_ACTIVE");
 
-    const buildXml = (reportName) => `
+    const buildXml = (reportName, requestCompany) => {
+      const companyXml = requestCompany
+        ? `\n          <SVCURRENTCOMPANY>${escapeXml(requestCompany)}</SVCURRENTCOMPANY>`
+        : "";
+      return `
 <ENVELOPE>
   <HEADER>
     <TALLYREQUEST>Export Data</TALLYREQUEST>
@@ -591,7 +732,7 @@ function fetchSalesVouchersFromTally(options = {}) {
       <REQUESTDESC>
         <REPORTNAME>${reportName}</REPORTNAME>
         <STATICVARIABLES>
-          <SVCURRENTCOMPANY>${companyName}</SVCURRENTCOMPANY>
+${companyXml}
           <SVFROMDATE>${SVFROMDATE}</SVFROMDATE>
           <SVTODATE>${SVTODATE}</SVTODATE>
           <SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>
@@ -601,6 +742,7 @@ function fetchSalesVouchersFromTally(options = {}) {
   </BODY>
 </ENVELOPE>
 `;
+    };
 
     const tryReports = [
       "Voucher Register",
@@ -614,10 +756,14 @@ function fetchSalesVouchersFromTally(options = {}) {
       toDate: SVTODATE,
       companyName,
       triedReports: [...tryReports],
+      requestMode: companyName ? "explicit_company" : "active_company",
       syncMode: syncWindow.mode,
       lastSyncAt: syncWindow.lastSyncAt || null,
       lookbackDays: syncWindow.lookbackDays || null,
       overlapDays: syncWindow.overlapDays || null,
+      checkpointCompany: syncWindow.checkpointCompany || null,
+      checkpointKey: syncWindow.checkpointKey || null,
+      futureBufferDays: SYNC_FUTURE_BUFFER_DAYS,
     };
 
     const optionsBase = {
@@ -701,28 +847,45 @@ function fetchSalesVouchersFromTally(options = {}) {
       let lastResponse = null;
       let lastReport = null;
 
-      for (const r of tryReports) {
-        try {
-          const xml = buildXml(r);
-          const resp = await sendXmlWithRetry(xml, r);
-          lastResponse = resp;
-          lastReport = r;
-          // quick heuristic: check if response contains <VOUCHER
-          const hasVoucher = resp && resp.data && resp.data.includes("<VOUCHER");
-          if (hasVoucher) {
-            return resolve({
-              xml: resp.data,
-              meta: {
-                ...metaBase,
-                selectedReport: r,
-                responseStatus: resp.statusCode,
-                responseBytes: Buffer.byteLength(resp.data || ""),
-                responseHasVoucher: true,
-              },
-            });
+      const requestCompanies = envCompany
+        ? [envCompany]
+        : companyHint
+        ? [companyHint, null]
+        : [null];
+
+      for (const requestCompany of requestCompanies) {
+        for (const r of tryReports) {
+          try {
+            const xml = buildXml(r, requestCompany);
+            const resp = await sendXmlWithRetry(xml, r);
+            lastResponse = resp;
+            lastReport = r;
+            // quick heuristic: check if response contains <VOUCHER
+            const hasVoucher = resp && resp.data && resp.data.includes("<VOUCHER");
+            if (hasVoucher) {
+              return resolve({
+                xml: resp.data,
+                meta: {
+                  ...metaBase,
+                  requestedCompany: requestCompany || null,
+                  detectedCompany:
+                    detectCompanyNameFromTallyXml(resp.data) ||
+                    requestCompany ||
+                    null,
+                  selectedReport: r,
+                  responseStatus: resp.statusCode,
+                  responseBytes: Buffer.byteLength(resp.data || ""),
+                  responseHasVoucher: true,
+                },
+              });
+            }
+          } catch (err) {
+            console.error(
+              "Tally request failed for report",
+              r,
+              err && err.message
+            );
           }
-        } catch (err) {
-          console.error("Tally request failed for report", r, err && err.message);
         }
       }
 
@@ -733,6 +896,11 @@ function fetchSalesVouchersFromTally(options = {}) {
             xml: lastResponse.data || "",
             meta: {
               ...metaBase,
+              requestedCompany: requestCompanies[0] || null,
+              detectedCompany:
+                detectCompanyNameFromTallyXml(lastResponse.data || "") ||
+                requestCompanies[0] ||
+                null,
               selectedReport: lastReport || tryReports[0],
               responseStatus: lastResponse.statusCode,
               responseBytes: Buffer.byteLength(lastResponse.data || ""),
@@ -741,12 +909,17 @@ function fetchSalesVouchersFromTally(options = {}) {
           });
         }
 
-        const last = buildXml(tryReports[0]);
+        const last = buildXml(tryReports[0], requestCompanies[0] || null);
         const fallback = await sendXmlWithRetry(last, tryReports[0]);
         return resolve({
           xml: fallback.data || "",
           meta: {
             ...metaBase,
+            requestedCompany: requestCompanies[0] || null,
+            detectedCompany:
+              detectCompanyNameFromTallyXml(fallback.data || "") ||
+              requestCompanies[0] ||
+              null,
             selectedReport: tryReports[0],
             responseStatus: fallback.statusCode,
             responseBytes: Buffer.byteLength(fallback.data || ""),
@@ -780,8 +953,11 @@ ipcMain.handle("sync-from-tally", async () => {
   try {
     await ensureFreshIdToken();
     const companyId = resolveCompanyId();
+    const companyHint = resolveTallyCompanyHint();
 
-    const tallyResult = await fetchSalesVouchersFromTally();
+    const tallyResult = await fetchSalesVouchersFromTally({
+      companyHint,
+    });
     const xml = tallyResult.xml || "";
     const meta = tallyResult.meta || {};
     console.log("TALLY XML RECEIVED:\n", xml.substring(0, 300));
@@ -815,7 +991,12 @@ ipcMain.handle("sync-from-tally", async () => {
       syncId,
       invoiceCount: invoices.length,
     });
-    saveLastSyncAt(new Date().toISOString());
+    const checkpointCompany =
+      normalizeCompanyName(meta.detectedCompany) ||
+      normalizeCompanyName(meta.requestedCompany) ||
+      companyHint ||
+      null;
+    saveLastSyncAt(new Date().toISOString(), { companyName: checkpointCompany });
     return { status: "ok", count: invoices.length };
   } catch (err) {
     console.error("TALLY ERROR:", err.message);
@@ -1115,9 +1296,11 @@ ipcMain.handle('start-sync', async (event, data) => {
     try {
       await ensureFreshIdToken();
       const companyId = resolveCompanyId();
+      const companyHint = resolveTallyCompanyHint();
 
       const tallyResult = await fetchSalesVouchersFromTally({
         modeOverride: isFullSync ? "full" : null,
+        companyHint,
       });
       const xml = tallyResult.xml || "";
       const meta = tallyResult.meta || {};
@@ -1153,7 +1336,12 @@ ipcMain.handle('start-sync', async (event, data) => {
         syncId,
         invoiceCount: invoices.length,
       });
-      saveLastSyncAt(new Date().toISOString());
+      const checkpointCompany =
+        normalizeCompanyName(meta.detectedCompany) ||
+        normalizeCompanyName(meta.requestedCompany) ||
+        companyHint ||
+        null;
+      saveLastSyncAt(new Date().toISOString(), { companyName: checkpointCompany });
       return { status: 'ok', method: SYNC_METHODS.LIVE, count: invoices.length };
     } catch (err) {
       console.error('LIVE sync error:', err && err.message);
@@ -1196,6 +1384,14 @@ ipcMain.handle("get-auth-status", async () => {
 
 ipcMain.handle("get-last-sync-summary", async () => {
   return readLastSyncSummary();
+});
+
+ipcMain.handle("get-sync-window-preview", async (event, data) => {
+  try {
+    return { status: "ok", preview: getSyncWindowPreview(data || {}) };
+  } catch (err) {
+    return { status: "error", message: err.message };
+  }
 });
 
 ipcMain.handle("logout", async () => {

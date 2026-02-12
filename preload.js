@@ -17,6 +17,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // UI helpers
   getAuthStatus: () => ipcRenderer.invoke('get-auth-status'),
   getLastSyncSummary: () => ipcRenderer.invoke('get-last-sync-summary'),
+  getSyncWindowPreview: (options) => ipcRenderer.invoke('get-sync-window-preview', options),
   // Logout
   logout: () => ipcRenderer.invoke('logout')
 });
