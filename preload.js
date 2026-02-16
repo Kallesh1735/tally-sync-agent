@@ -18,6 +18,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   getAuthStatus: () => ipcRenderer.invoke('get-auth-status'),
   getLastSyncSummary: () => ipcRenderer.invoke('get-last-sync-summary'),
   getSyncWindowPreview: (options) => ipcRenderer.invoke('get-sync-window-preview', options),
+  getPdfWorkerStatus: () => ipcRenderer.invoke('get-pdf-worker-status'),
+  runPdfWorkerOnce: () => ipcRenderer.invoke('run-pdf-worker-once'),
   // Logout
   logout: () => ipcRenderer.invoke('logout')
 });

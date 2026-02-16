@@ -10,6 +10,30 @@ const { XMLParser } = require("fast-xml-parser");
 // Production Vercel API URL (HTTPS)
 const BACKEND_SYNC_URL =
   "https://giro-pie-frontend.vercel.app/api/sync-tally";
+const DEFAULT_BACKEND_BASE_URL = "https://giro-pie-frontend.vercel.app";
+
+function parseBooleanEnv(value, defaultValue = false) {
+  if (value === undefined || value === null || value === "") {
+    return defaultValue;
+  }
+  const normalized = String(value).trim().toLowerCase();
+  return ["1", "true", "yes", "on"].includes(normalized);
+}
+
+function deriveUrlOrigin(urlString) {
+  try {
+    const u = new URL(urlString);
+    return `${u.protocol}//${u.host}`;
+  } catch (err) {
+    return "";
+  }
+}
+
+const BACKEND_BASE_URL = (
+  process.env.BACKEND_BASE_URL ||
+  DEFAULT_BACKEND_BASE_URL ||
+  deriveUrlOrigin(BACKEND_SYNC_URL)
+).replace(/\/+$/, "");
 
 const { app, BrowserWindow, ipcMain } = require("electron");
 const path = require("path");
@@ -61,6 +85,31 @@ const SYNC_OVERLAP_DAYS = Number(process.env.SYNC_OVERLAP_DAYS || 1);
 const SYNC_FULL_LOOKBACK_DAYS = Number(process.env.SYNC_FULL_LOOKBACK_DAYS || 365);
 const SYNC_FUTURE_BUFFER_DAYS = Number(process.env.SYNC_FUTURE_BUFFER_DAYS || 0);
 const lastSyncFilePath = path.join(app.getPath("userData"), "lastSync.json");
+const ENABLE_PDF_WORKER = parseBooleanEnv(process.env.ENABLE_PDF_WORKER, false);
+const PDF_WORKER_POLL_MS = Number(process.env.PDF_WORKER_POLL_MS || 3000);
+const PDF_JOB_REQUEST_TIMEOUT_MS = Number(
+  process.env.PDF_JOB_REQUEST_TIMEOUT_MS || BACKEND_REQUEST_TIMEOUT_MS
+);
+const PDF_JOB_CLAIM_PATH =
+  process.env.PDF_JOB_CLAIM_PATH || "/api/agent/pdf-jobs/claim";
+const PDF_JOB_COMPLETE_PATH =
+  process.env.PDF_JOB_COMPLETE_PATH || "/api/agent/pdf-jobs/:jobId/complete";
+const PDF_JOB_FAIL_PATH =
+  process.env.PDF_JOB_FAIL_PATH || "/api/agent/pdf-jobs/:jobId/fail";
+const PDF_TALLY_REQUEST_TIMEOUT_MS = Number(
+  process.env.PDF_TALLY_TIMEOUT_MS || TALLY_REQUEST_TIMEOUT_MS
+);
+const PDF_HTML_RENDER_TIMEOUT_MS = Number(
+  process.env.PDF_HTML_RENDER_TIMEOUT_MS || 30000
+);
+const PDF_STRICT_TALLY_LAYOUT = parseBooleanEnv(
+  process.env.PDF_STRICT_TALLY_LAYOUT,
+  true
+);
+
+let pdfWorkerTimer = null;
+let pdfWorkerRunning = false;
+let pdfWorkerBusy = false;
 
 console.log(
   "Timeouts:",
@@ -76,6 +125,15 @@ console.log(
   `SYNC_OVERLAP_DAYS=${SYNC_OVERLAP_DAYS}`,
   `SYNC_FULL_LOOKBACK_DAYS=${SYNC_FULL_LOOKBACK_DAYS}`,
   `SYNC_FUTURE_BUFFER_DAYS=${SYNC_FUTURE_BUFFER_DAYS}`
+);
+console.log(
+  "PDF worker:",
+  `BACKEND_BASE_URL=${BACKEND_BASE_URL}`,
+  `ENABLE_PDF_WORKER=${ENABLE_PDF_WORKER}`,
+  `PDF_WORKER_POLL_MS=${PDF_WORKER_POLL_MS}`,
+  `PDF_JOB_CLAIM_PATH=${PDF_JOB_CLAIM_PATH}`,
+  `PDF_TALLY_TIMEOUT_MS=${PDF_TALLY_REQUEST_TIMEOUT_MS}`,
+  `PDF_STRICT_TALLY_LAYOUT=${PDF_STRICT_TALLY_LAYOUT}`
 );
 
 function delay(ms) {
@@ -629,6 +687,9 @@ app.whenReady().then(() => {
   loadAuthFromDisk();
 
   createWindow();
+  if (currentIdToken) {
+    startPdfWorker("app_ready_with_saved_session");
+  }
 });
 
 app.on("window-all-closed", () => {
@@ -637,6 +698,10 @@ app.on("window-all-closed", () => {
 
 app.on("activate", () => {
   if (BrowserWindow.getAllWindows().length === 0) createWindow();
+});
+
+app.on("before-quit", () => {
+  stopPdfWorker("app_quit");
 });
 
 // -----------------------------
@@ -682,6 +747,7 @@ ipcMain.handle("login", async (event, creds) => {
     currentUserEmail = authData.email;
 
     saveAuthToDisk();
+    startPdfWorker("login_success");
 
     console.log("Login successful: Firebase user authenticated");
     return { status: "ok" };
@@ -1067,6 +1133,1024 @@ function sendInvoicesToBackend(invoices, options = {}) {
   });
 }
 
+function buildBackendUrl(apiPath) {
+  if (!BACKEND_BASE_URL) {
+    throw new Error("BACKEND_BASE_URL is not configured");
+  }
+  const normalizedPath = String(apiPath || "").startsWith("/")
+    ? String(apiPath)
+    : `/${String(apiPath || "")}`;
+  return `${BACKEND_BASE_URL}${normalizedPath}`;
+}
+
+function resolvePathWithJobId(pathTemplate, jobId) {
+  const encoded = encodeURIComponent(String(jobId || "").trim());
+  if (!encoded) {
+    throw new Error("Missing PDF job id");
+  }
+  if (pathTemplate.includes(":jobId")) {
+    return pathTemplate.replace(":jobId", encoded);
+  }
+  const cleaned = pathTemplate.replace(/\/+$/, "");
+  return `${cleaned}/${encoded}`;
+}
+
+function parseMaybeJson(input) {
+  if (!input || !String(input).trim()) return null;
+  try {
+    return JSON.parse(input);
+  } catch (err) {
+    return null;
+  }
+}
+
+function summarizeResponseBody(body, maxLen = 500) {
+  if (!body) return "";
+  const raw = typeof body === "string" ? body : JSON.stringify(body);
+  return raw.length > maxLen ? `${raw.slice(0, maxLen)}...` : raw;
+}
+
+function buildStageError(stagePrefix, err) {
+  const statusCode =
+    err && typeof err.statusCode === "number" ? err.statusCode : null;
+  const responseRaw =
+    (err && (err.responseBody || err.rawBody)) ||
+    (err && err.responseJson ? JSON.stringify(err.responseJson) : "");
+  const message =
+    err && err.message ? err.message : typeof err === "string" ? err : "Unknown error";
+  const bodyPart = responseRaw
+    ? ` | body=${summarizeResponseBody(responseRaw, 700)}`
+    : "";
+  if (statusCode) {
+    return `${stagePrefix}_${statusCode}: ${message}${bodyPart}`;
+  }
+  return `${stagePrefix}: ${message}${bodyPart}`;
+}
+
+async function requestBackendJson(url, options = {}) {
+  const retried401 = Boolean(options.__retried401);
+  await ensureFreshIdToken();
+
+  const runRequest = () =>
+    new Promise((resolve, reject) => {
+      const payload =
+        options.payload === undefined ? null : JSON.stringify(options.payload);
+      const headers = {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${currentIdToken}`,
+        ...(options.headers || {}),
+      };
+      if (payload !== null) {
+        headers["Content-Length"] = Buffer.byteLength(payload);
+      }
+
+      const req = https.request(
+        url,
+        {
+          method: options.method || "GET",
+          headers,
+        },
+        (res) => {
+          let data = "";
+          res.on("data", (c) => (data += c.toString()));
+          res.on("end", () => {
+            clearTimeout(timeoutHandle);
+            const parsed = parseMaybeJson(data);
+            if (res.statusCode < 200 || res.statusCode >= 300) {
+              const errorMessage =
+                (parsed && (parsed.error || parsed.message)) ||
+                `Request failed (${res.statusCode}): ${data}`;
+              const err = new Error(errorMessage);
+              err.statusCode = res.statusCode;
+              err.responseBody = data;
+              err.responseJson = parsed;
+              err.rawBody = data;
+              return reject(err);
+            }
+            resolve({
+              statusCode: res.statusCode,
+              body: parsed || null,
+              rawBody: data,
+            });
+          });
+        }
+      );
+
+      const timeoutMs = Number(options.timeoutMs || PDF_JOB_REQUEST_TIMEOUT_MS);
+      const timeoutHandle = setTimeout(() => {
+        req.destroy(new Error(`Backend request timed out after ${timeoutMs}ms`));
+      }, timeoutMs);
+
+      req.on("error", (err) => {
+        clearTimeout(timeoutHandle);
+        reject(err);
+      });
+      if (payload !== null) {
+        req.write(payload);
+      }
+      req.end();
+    });
+
+  try {
+    return await runRequest();
+  } catch (err) {
+    if (err && err.statusCode === 401 && !retried401) {
+      writeSyncLog({
+        ts: new Date().toISOString(),
+        level: "warn",
+        event: "pdf_backend_401_retry",
+        url,
+      });
+      await ensureFreshIdToken();
+      return requestBackendJson(url, {
+        ...options,
+        __retried401: true,
+      });
+    }
+    throw err;
+  }
+}
+
+async function claimNextPdfJob() {
+  const companyId = resolveCompanyId();
+  writeSyncLog({
+    ts: new Date().toISOString(),
+    level: "info",
+    event: "pdf_claim_request",
+    companyId: companyId || null,
+    path: PDF_JOB_CLAIM_PATH,
+  });
+  const res = await requestBackendJson(buildBackendUrl(PDF_JOB_CLAIM_PATH), {
+    method: "POST",
+    payload: {
+      companyId: companyId || null,
+      agent: {
+        name: "giropie-tally-agent",
+        version: app.getVersion(),
+        platform: process.platform,
+      },
+    },
+    timeoutMs: PDF_JOB_REQUEST_TIMEOUT_MS,
+  });
+  writeSyncLog({
+    ts: new Date().toISOString(),
+    level: "info",
+    event: "pdf_claim_response",
+    statusCode: res.statusCode,
+    body: summarizeResponseBody(res.body || res.rawBody),
+  });
+
+  if (res.statusCode === 204 || !res.body) return null;
+  const body = res.body;
+  if (body.status === "empty" || body.job === null) return null;
+  if (body.job && typeof body.job === "object") return body.job;
+  if (body.id || body.jobId) return body;
+  return null;
+}
+
+async function markPdfJobComplete(jobId, payload) {
+  const pathWithId = resolvePathWithJobId(PDF_JOB_COMPLETE_PATH, jobId);
+  writeSyncLog({
+    ts: new Date().toISOString(),
+    level: "info",
+    event: "pdf_complete_request",
+    jobId,
+    path: pathWithId,
+    payloadInfo: {
+      fileName: payload && payload.fileName ? payload.fileName : null,
+      mimeType: payload && payload.mimeType ? payload.mimeType : null,
+      pdfBase64Bytes: payload && payload.pdfBase64
+        ? Buffer.byteLength(String(payload.pdfBase64), "utf8")
+        : 0,
+    },
+  });
+  const res = await requestBackendJson(buildBackendUrl(pathWithId), {
+    method: "POST",
+    payload,
+    timeoutMs: PDF_JOB_REQUEST_TIMEOUT_MS,
+  });
+  writeSyncLog({
+    ts: new Date().toISOString(),
+    level: "info",
+    event: "pdf_complete_response",
+    jobId,
+    statusCode: res.statusCode,
+    body: summarizeResponseBody(res.body || res.rawBody),
+  });
+  return res;
+}
+
+async function markPdfJobFailed(jobId, errorMessage) {
+  const pathWithId = resolvePathWithJobId(PDF_JOB_FAIL_PATH, jobId);
+  const payload = { error: String(errorMessage || "Unknown PDF generation error") };
+  writeSyncLog({
+    ts: new Date().toISOString(),
+    level: "error",
+    event: "pdf_fail_request",
+    jobId,
+    path: pathWithId,
+    payload,
+  });
+  const res = await requestBackendJson(buildBackendUrl(pathWithId), {
+    method: "POST",
+    payload,
+    timeoutMs: PDF_JOB_REQUEST_TIMEOUT_MS,
+  });
+  writeSyncLog({
+    ts: new Date().toISOString(),
+    level: "info",
+    event: "pdf_fail_response",
+    jobId,
+    statusCode: res.statusCode,
+    body: summarizeResponseBody(res.body || res.rawBody),
+  });
+  return res;
+}
+
+function readPdfFromLocalPath(localPdfPath) {
+  const absPath = path.resolve(localPdfPath);
+  const bytes = fs.readFileSync(absPath);
+  const fileName = path.basename(absPath);
+  return {
+    fileName,
+    mimeType: "application/pdf",
+    pdfBase64: bytes.toString("base64"),
+  };
+}
+
+function getJobField(job, ...keys) {
+  if (!job || typeof job !== "object") return null;
+  for (const key of keys) {
+    if (!key) continue;
+    const value = job[key];
+    if (value !== undefined && value !== null && String(value).trim() !== "") {
+      return value;
+    }
+    if (job.invoice && job.invoice[key] !== undefined && job.invoice[key] !== null) {
+      const nested = job.invoice[key];
+      if (String(nested).trim() !== "") return nested;
+    }
+  }
+  return null;
+}
+
+function normalizeDateToYmd(input) {
+  if (!input) return null;
+  const str = String(input).trim();
+  if (/^\d{8}$/.test(str)) return str;
+
+  const onlyDigits = str.replace(/[^\d]/g, "");
+  if (onlyDigits.length === 8) return onlyDigits;
+
+  const parsed = new Date(str);
+  if (!isNaN(parsed.getTime())) {
+    return formatYMDDate(parsed);
+  }
+  return null;
+}
+
+function ymdToDdMmYyyy(ymd) {
+  if (!ymd || !/^\d{8}$/.test(String(ymd))) return null;
+  const raw = String(ymd);
+  return `${raw.slice(6, 8)}-${raw.slice(4, 6)}-${raw.slice(0, 4)}`;
+}
+
+function buildTallyDateVariants(rawDate) {
+  const ymd = normalizeDateToYmd(rawDate);
+  if (!ymd) return [];
+  const variants = [ymd];
+  const ddmmyyyy = ymdToDdMmYyyy(ymd);
+  if (ddmmyyyy) variants.push(ddmmyyyy);
+  return [...new Set(variants.filter(Boolean))];
+}
+
+function parseIdentityKey(identityKey) {
+  if (!identityKey) return {};
+  const raw = String(identityKey).trim();
+  if (!raw) return {};
+
+  const sepIndex = raw.indexOf(":");
+  const suffix = sepIndex >= 0 ? raw.slice(sepIndex + 1).trim() : raw;
+  if (!suffix) return {};
+
+  if (suffix.includes("|")) {
+    const [invoiceNoPart, invoiceDatePart] = suffix.split("|");
+    return {
+      invoiceNo: invoiceNoPart ? String(invoiceNoPart).trim() : null,
+      invoiceDate: invoiceDatePart ? String(invoiceDatePart).trim() : null,
+    };
+  }
+
+  return { sourceId: suffix };
+}
+
+function isUsableCompanyName(name) {
+  if (!name) return false;
+  const raw = String(name).trim();
+  if (!raw) return false;
+  // Email/user identifiers are not valid Tally company names and should not be forced
+  if (raw.includes("@")) return false;
+  const upper = raw.toUpperCase();
+  const invalid = new Set(["AUTO", "AUTO_ACTIVE", "UNKNOWN", "N/A", "NULL"]);
+  return !invalid.has(upper);
+}
+
+function resolvePdfIdentity(job) {
+  const fromIdentityKey = parseIdentityKey(getJobField(job, "identityKey"));
+  const sourceId = String(
+    getJobField(
+      job,
+      "sourceId",
+      "remoteId",
+      "remoteID",
+      "guid",
+      "voucherGuid",
+      "masterId",
+      "alterId"
+    ) ||
+      fromIdentityKey.sourceId ||
+      ""
+  ).trim() || null;
+  const invoiceNo = String(
+    getJobField(job, "invoiceNo", "voucherNumber", "number") ||
+      fromIdentityKey.invoiceNo ||
+      ""
+  ).trim() || null;
+  const invoiceDateRaw =
+    getJobField(job, "invoiceDate", "invoiceDateISO", "date") ||
+    fromIdentityKey.invoiceDate ||
+    null;
+  const invoiceDateYmd = normalizeDateToYmd(invoiceDateRaw);
+  const voucherTypeName = String(
+    getJobField(job, "voucherTypeName", "voucherType", "vchType") || "Sales"
+  ).trim() || "Sales";
+
+  const companyNameRaw = normalizeCompanyName(
+    getJobField(job, "companyName", "tallyCompanyName")
+  );
+  const companyName = isUsableCompanyName(companyNameRaw) ? companyNameRaw : null;
+
+  return {
+    sourceId,
+    identityKey: getJobField(job, "identityKey") || null,
+    invoiceNo,
+    invoiceDateRaw,
+    invoiceDateYmd,
+    dateVariants: buildTallyDateVariants(invoiceDateRaw),
+    voucherTypeName,
+    companyName,
+    strategy: sourceId ? "sourceId" : "invoiceNoDate",
+  };
+}
+
+function computePdfWindowFromJob(job, overrideDateYmd = null) {
+  const invoiceDateYmd =
+    overrideDateYmd ||
+    normalizeDateToYmd(getJobField(job, "invoiceDate", "invoiceDateISO", "date"));
+  if (!invoiceDateYmd) {
+    const now = new Date();
+    const fromDate = new Date(now);
+    fromDate.setDate(fromDate.getDate() - 90);
+    return {
+      fromDateYmd: formatYMDDate(fromDate),
+      toDateYmd: formatYMDDate(now),
+      invoiceDateYmd: null,
+    };
+  }
+
+  const y = Number(invoiceDateYmd.slice(0, 4));
+  const m = Number(invoiceDateYmd.slice(4, 6)) - 1;
+  const d = Number(invoiceDateYmd.slice(6, 8));
+  const center = new Date(y, m, d);
+  const fromDate = new Date(center);
+  fromDate.setDate(fromDate.getDate() - 7);
+  const toDate = new Date(center);
+  toDate.setDate(toDate.getDate() + 7);
+  return {
+    fromDateYmd: formatYMDDate(fromDate),
+    toDateYmd: formatYMDDate(toDate),
+    invoiceDateYmd,
+  };
+}
+
+function extractTallyLineError(raw) {
+  if (!raw || typeof raw !== "string") return null;
+  const match = raw.match(/<LINEERROR>([\s\S]*?)<\/LINEERROR>/i);
+  if (!match || !match[1]) return null;
+  return decodeXmlEntities(match[1]).trim();
+}
+
+function decodeXmlEntities(input) {
+  if (!input) return input;
+  return String(input)
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&amp;/g, "&")
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'");
+}
+
+function extractHtmlFromTallyPayload(raw) {
+  if (!raw || typeof raw !== "string") return null;
+  const directHtmlMatch = raw.match(/<!doctype[\s\S]*<\/html>/i) || raw.match(/<html[\s\S]*<\/html>/i);
+  if (directHtmlMatch) return directHtmlMatch[0];
+
+  const wrappedHtmlMatch =
+    raw.match(/<HTML>([\s\S]*?)<\/HTML>/i) ||
+    raw.match(/<REPORTHTML>([\s\S]*?)<\/REPORTHTML>/i);
+  if (wrappedHtmlMatch && wrappedHtmlMatch[1]) {
+    const decoded = decodeXmlEntities(wrappedHtmlMatch[1]);
+    const nestedMatch =
+      decoded.match(/<!doctype[\s\S]*<\/html>/i) ||
+      decoded.match(/<html[\s\S]*<\/html>/i);
+    return nestedMatch ? nestedMatch[0] : decoded;
+  }
+  return null;
+}
+
+function buildStaticVariablesXml(entries) {
+  const lines = [];
+  for (const [key, value] of Object.entries(entries)) {
+    if (value === null || value === undefined || String(value).trim() === "") continue;
+    lines.push(`          <${key}>${escapeXml(value)}</${key}>`);
+  }
+  return lines.join("\n");
+}
+
+function requestTallyRaw(xml, timeoutMs = PDF_TALLY_REQUEST_TIMEOUT_MS) {
+  return new Promise((resolve, reject) => {
+    const req = http.request(
+      {
+        hostname: "127.0.0.1",
+        port: 9000,
+        method: "POST",
+        headers: {
+          "Content-Type": "text/xml",
+          "Content-Length": Buffer.byteLength(xml),
+        },
+      },
+      (res) => {
+        let data = "";
+        res.on("data", (c) => (data += c.toString()));
+        res.on("end", () => {
+          clearTimeout(timeoutHandle);
+          resolve({
+            statusCode: res.statusCode,
+            body: data,
+          });
+        });
+      }
+    );
+
+    const timeoutHandle = setTimeout(() => {
+      req.destroy(new Error(`Tally PDF request timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+
+    req.on("error", (err) => {
+      clearTimeout(timeoutHandle);
+      reject(err);
+    });
+    req.write(xml);
+    req.end();
+  });
+}
+
+async function fetchInvoicePrintHtmlFromTally(job) {
+  const jobId = job.jobId || job.id || null;
+  const identity = resolvePdfIdentity(job);
+
+  if (!identity.sourceId && !identity.invoiceNo) {
+    throw new Error(
+      "TALLY_FETCH: Missing invoice identity in PDF job (need sourceId/identityKey or invoiceNo)"
+    );
+  }
+
+  writeSyncLog({
+    ts: new Date().toISOString(),
+    level: "info",
+    event: "pdf_identity_payload",
+    jobId,
+    strategy: identity.strategy,
+    sourceId: identity.sourceId || null,
+    identityKey: identity.identityKey || null,
+    invoiceNo: identity.invoiceNo || null,
+    invoiceDateRaw: identity.invoiceDateRaw || null,
+    invoiceDateYmd: identity.invoiceDateYmd || null,
+    dateVariants: identity.dateVariants,
+    voucherTypeName: identity.voucherTypeName,
+    companyName: identity.companyName || null,
+  });
+
+  const window = computePdfWindowFromJob(job, identity.invoiceDateYmd);
+  const reportNames = [
+    "Voucher Printing",
+    "Voucher",
+    "Sales Invoice",
+    "Invoice",
+  ];
+  const dateVariants =
+    identity.dateVariants.length > 0 ? identity.dateVariants : [null];
+
+  const identityVarSets = [];
+  if (identity.sourceId) {
+    identityVarSets.push({
+      name: "source_id",
+      vars: {
+        SVGUID: identity.sourceId,
+        GUID: identity.sourceId,
+        REMOTEID: identity.sourceId,
+        SVREMOTEID: identity.sourceId,
+      },
+    });
+  }
+  if (identity.invoiceNo) {
+    identityVarSets.push({
+      name: "invoice_no",
+      vars: {
+        SVVOUCHERNUMBER: identity.invoiceNo,
+        VOUCHERNUMBER: identity.invoiceNo,
+      },
+    });
+  }
+  if (identityVarSets.length === 0) {
+    identityVarSets.push({ name: "none", vars: {} });
+  }
+
+  const attempts = [];
+  for (const reportName of reportNames) {
+    for (const identitySet of identityVarSets) {
+      for (const dateVariant of dateVariants) {
+        const baseVars = {
+          SVEXPORTFORMAT: "$$SysName:HTML",
+          SVFROMDATE: window.fromDateYmd,
+          SVTODATE: window.toDateYmd,
+          SVVIEWNAME: "Invoice Voucher View",
+          EXPLODEFLAG: "Yes",
+          SVVOUCHERTYPENAME: identity.voucherTypeName || "Sales",
+          SVPRINTTYPE: "Invoice",
+          ...(identity.companyName
+            ? { SVCURRENTCOMPANY: identity.companyName }
+            : {}),
+          ...identitySet.vars,
+        };
+        if (dateVariant) {
+          baseVars.SVOUCHERDATE = dateVariant;
+          baseVars.SVVOUCHERDATE = dateVariant;
+          baseVars.SVDATE = dateVariant;
+          baseVars.DATE = dateVariant;
+        }
+        attempts.push({
+          shape: "export_data",
+          reportName,
+          identitySetName: identitySet.name,
+          dateVariant: dateVariant || "none",
+          vars: baseVars,
+        });
+        attempts.push({
+          shape: "export",
+          reportName,
+          identitySetName: identitySet.name,
+          dateVariant: dateVariant || "none",
+          vars: baseVars,
+        });
+      }
+    }
+  }
+
+  const failures = [];
+
+  for (let i = 0; i < attempts.length; i += 1) {
+    const attempt = attempts[i];
+    const staticVarsXml = buildStaticVariablesXml(attempt.vars);
+    const xml =
+      attempt.shape === "export"
+        ? `
+<ENVELOPE>
+  <HEADER>
+    <VERSION>1</VERSION>
+    <TALLYREQUEST>Export</TALLYREQUEST>
+    <TYPE>Data</TYPE>
+    <ID>${escapeXml(attempt.reportName)}</ID>
+  </HEADER>
+  <BODY>
+    <DESC>
+      <STATICVARIABLES>
+${staticVarsXml}
+      </STATICVARIABLES>
+    </DESC>
+  </BODY>
+</ENVELOPE>
+`
+        : `
+<ENVELOPE>
+  <HEADER>
+    <TALLYREQUEST>Export Data</TALLYREQUEST>
+  </HEADER>
+  <BODY>
+    <EXPORTDATA>
+      <REQUESTDESC>
+        <REPORTNAME>${escapeXml(attempt.reportName)}</REPORTNAME>
+        <STATICVARIABLES>
+${staticVarsXml}
+        </STATICVARIABLES>
+      </REQUESTDESC>
+    </EXPORTDATA>
+  </BODY>
+</ENVELOPE>
+`;
+
+    writeSyncLog({
+      ts: new Date().toISOString(),
+      level: "info",
+      event: "pdf_tally_variant_attempt",
+      jobId,
+      attemptNo: i + 1,
+      totalAttempts: attempts.length,
+      shape: attempt.shape,
+      reportName: attempt.reportName,
+      identitySet: attempt.identitySetName,
+      dateVariant: attempt.dateVariant,
+      forcedCompany: identity.companyName || null,
+    });
+
+    try {
+      const resp = await requestTallyRaw(xml);
+      const html = extractHtmlFromTallyPayload(resp.body);
+      const lineError = extractTallyLineError(resp.body);
+      if (html && html.length > 100) {
+        writeSyncLog({
+          ts: new Date().toISOString(),
+          level: "info",
+          event: "pdf_tally_html_found",
+          jobId,
+          reportName: attempt.reportName,
+          shape: attempt.shape,
+          identitySet: attempt.identitySetName,
+          dateVariant: attempt.dateVariant,
+          statusCode: resp.statusCode,
+        });
+        return {
+          html,
+          reportName: attempt.reportName,
+          shape: attempt.shape,
+          identitySet: attempt.identitySetName,
+          dateVariant: attempt.dateVariant,
+        };
+      }
+
+      failures.push(
+        `#${i + 1} ${attempt.shape}/${attempt.reportName}/${attempt.identitySetName}/${attempt.dateVariant}: status=${resp.statusCode}${
+          lineError ? ` lineError=${lineError}` : ""
+        }`
+      );
+    } catch (err) {
+      failures.push(
+        `#${i + 1} ${attempt.shape}/${attempt.reportName}/${attempt.identitySetName}/${attempt.dateVariant}: error=${
+          err && err.message ? err.message : String(err)
+        }`
+      );
+    }
+  }
+
+  const detail = failures.slice(0, 6).join(" || ");
+  throw new Error(
+    `TALLY_FETCH: Unable to export printable HTML from Tally for invoice ${
+      identity.invoiceNo || "unknown"
+    }. Attempts=${attempts.length}. Details=${detail || "none"}`
+  );
+}
+
+async function renderHtmlToPdfBase64(html) {
+  const win = new BrowserWindow({
+    show: false,
+    webPreferences: {
+      contextIsolation: true,
+      sandbox: true,
+    },
+  });
+  try {
+    const dataUrl = `data:text/html;base64,${Buffer.from(html, "utf-8").toString("base64")}`;
+    await win.loadURL(dataUrl);
+    const pdfBuffer = await Promise.race([
+      win.webContents.printToPDF({
+        printBackground: true,
+        pageSize: "A4",
+        margins: {
+          top: 0,
+          bottom: 0,
+          left: 0,
+          right: 0,
+        },
+      }),
+      new Promise((_, reject) =>
+        setTimeout(
+          () => reject(new Error(`HTML render timed out after ${PDF_HTML_RENDER_TIMEOUT_MS}ms`)),
+          PDF_HTML_RENDER_TIMEOUT_MS
+        )
+      ),
+    ]);
+    return pdfBuffer.toString("base64");
+  } finally {
+    if (!win.isDestroyed()) {
+      win.destroy();
+    }
+  }
+}
+
+function buildFallbackInvoiceHtml(job) {
+  const invoiceNo = getJobField(job, "invoiceNo", "voucherNumber", "number") || "-";
+  const customerName = getJobField(job, "customerName", "partyName") || "-";
+  const invoiceDate =
+    getJobField(job, "invoiceDate", "invoiceDateISO", "date") || "-";
+  const totalAmount =
+    getJobField(job, "totalAmount", "amount", "invoiceAmount") || "-";
+  const companyName = getJobField(job, "companyName", "tallyCompanyName") || "Company";
+
+  return `<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <style>
+    body { font-family: Arial, sans-serif; margin: 24px; color: #111; }
+    h1 { font-size: 24px; margin: 0 0 12px; }
+    .meta { margin-bottom: 16px; }
+    table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+    th, td { border: 1px solid #333; padding: 8px; text-align: left; }
+    .right { text-align: right; }
+  </style>
+</head>
+<body>
+  <h1>INVOICE</h1>
+  <div class="meta"><strong>${escapeXml(String(companyName))}</strong></div>
+  <table>
+    <tr><th>Invoice No</th><td>${escapeXml(String(invoiceNo))}</td></tr>
+    <tr><th>Invoice Date</th><td>${escapeXml(String(invoiceDate))}</td></tr>
+    <tr><th>Customer</th><td>${escapeXml(String(customerName))}</td></tr>
+    <tr><th>Total Amount</th><td class="right">${escapeXml(String(totalAmount))}</td></tr>
+  </table>
+</body>
+</html>`;
+}
+
+async function generateInvoicePdfFromTally(job) {
+  if (job && typeof job.pdfBase64 === "string" && job.pdfBase64.length > 0) {
+    return {
+      fileName: job.fileName || `invoice-${job.jobId || Date.now()}.pdf`,
+      mimeType: "application/pdf",
+      pdfBase64: job.pdfBase64,
+    };
+  }
+  if (job && typeof job.localPdfPath === "string" && job.localPdfPath.length > 0) {
+    return readPdfFromLocalPath(job.localPdfPath);
+  }
+
+  if (job && typeof job.tallyPrintHtml === "string" && job.tallyPrintHtml.length > 0) {
+    let pdfBase64;
+    try {
+      pdfBase64 = await renderHtmlToPdfBase64(job.tallyPrintHtml);
+    } catch (err) {
+      throw new Error(buildStageError("PDF_RENDER", err));
+    }
+    return {
+      fileName: job.fileName || `invoice-${job.jobId || Date.now()}.pdf`,
+      mimeType: "application/pdf",
+      pdfBase64,
+    };
+  }
+
+  let htmlResult = null;
+  let htmlFetchError = null;
+  try {
+    htmlResult = await fetchInvoicePrintHtmlFromTally(job);
+  } catch (err) {
+    htmlFetchError = err;
+    writeSyncLog({
+      ts: new Date().toISOString(),
+      level: "error",
+      event: "pdf_tally_html_fetch_failed",
+      jobId: job.jobId || job.id || null,
+      error: err && err.message ? err.message : String(err),
+    });
+  }
+
+  if (htmlResult && htmlResult.html) {
+    let pdfBase64;
+    try {
+      pdfBase64 = await renderHtmlToPdfBase64(htmlResult.html);
+    } catch (err) {
+      throw new Error(buildStageError("PDF_RENDER", err));
+    }
+    return {
+      fileName:
+        job.fileName ||
+        `invoice-${String(getJobField(job, "invoiceNo", "voucherNumber") || job.jobId || Date.now())}.pdf`,
+      mimeType: "application/pdf",
+      pdfBase64,
+    };
+  }
+
+  if (!PDF_STRICT_TALLY_LAYOUT) {
+    const fallbackHtml = buildFallbackInvoiceHtml(job);
+    let pdfBase64;
+    try {
+      pdfBase64 = await renderHtmlToPdfBase64(fallbackHtml);
+    } catch (err) {
+      throw new Error(buildStageError("PDF_RENDER", err));
+    }
+    writeSyncLog({
+      ts: new Date().toISOString(),
+      level: "warn",
+      event: "pdf_fallback_used",
+      jobId: job.jobId || job.id || null,
+      reason: htmlFetchError ? htmlFetchError.message : "no_tally_html",
+    });
+    return {
+      fileName: job.fileName || `invoice-${job.jobId || Date.now()}.pdf`,
+      mimeType: "application/pdf",
+      pdfBase64,
+    };
+  }
+
+  if (htmlFetchError) throw htmlFetchError;
+  throw new Error("Failed to generate exact Tally invoice PDF");
+}
+
+async function processOnePdfJob() {
+  const job = await claimNextPdfJob();
+  if (!job) return { status: "idle" };
+
+  const jobId = job.jobId || job.id;
+  if (!jobId) {
+    throw new Error("Received PDF job without jobId");
+  }
+
+  writeSyncLog({
+    ts: new Date().toISOString(),
+    level: "info",
+    event: "pdf_job_claimed",
+    jobId,
+    invoiceId: job.invoiceId || null,
+  });
+
+  let result = null;
+  let processingError = null;
+  try {
+    let pdfResult;
+    try {
+      pdfResult = await generateInvoicePdfFromTally(job);
+    } catch (err) {
+      const msg = err && err.message ? err.message : String(err);
+      if (msg.startsWith("TALLY_FETCH:") || msg.startsWith("PDF_RENDER:")) {
+        throw err;
+      }
+      throw new Error(buildStageError("PDF_GENERATE", err));
+    }
+
+    try {
+      await markPdfJobComplete(jobId, {
+        fileName: pdfResult.fileName,
+        mimeType: pdfResult.mimeType || "application/pdf",
+        pdfBase64: pdfResult.pdfBase64,
+        agentMeta: {
+          version: app.getVersion(),
+          platform: process.platform,
+          processedAt: new Date().toISOString(),
+        },
+      });
+    } catch (err) {
+      throw new Error(buildStageError("COMPLETE_API", err));
+    }
+
+    result = { status: "done", jobId };
+  } catch (err) {
+    processingError = err;
+  } finally {
+    if (!result) {
+      const msg =
+        processingError && processingError.message
+          ? processingError.message
+          : "PDF_PIPELINE: Unknown PDF job error";
+      try {
+        await markPdfJobFailed(jobId, msg);
+        result = { status: "failed", jobId, error: msg };
+      } catch (failErr) {
+        const firstFailMsg =
+          failErr && failErr.message ? failErr.message : String(failErr);
+        writeSyncLog({
+          ts: new Date().toISOString(),
+          level: "error",
+          event: "pdf_job_fail_callback_error",
+          jobId,
+          attempt: 1,
+          error: firstFailMsg,
+        });
+        try {
+          await delay(300);
+          await markPdfJobFailed(
+            jobId,
+            `${msg} | FAIL_API_RETRY_AFTER_ERROR: ${firstFailMsg}`
+          );
+          result = { status: "failed", jobId, error: msg };
+        } catch (retryErr) {
+          writeSyncLog({
+            ts: new Date().toISOString(),
+            level: "error",
+            event: "pdf_job_fail_callback_error",
+            jobId,
+            attempt: 2,
+            error:
+              retryErr && retryErr.message
+                ? retryErr.message
+                : String(retryErr),
+          });
+        }
+      }
+    }
+  }
+
+  if (result && result.status === "done") {
+    writeSyncLog({
+      ts: new Date().toISOString(),
+      level: "info",
+      event: "pdf_job_completed",
+      jobId,
+      invoiceId: job.invoiceId || null,
+    });
+    return result;
+  }
+
+  writeSyncLog({
+    ts: new Date().toISOString(),
+    level: "error",
+    event: "pdf_job_failed",
+    jobId,
+    error: result && result.error ? result.error : "Failed to finalize PDF job",
+  });
+  return result || { status: "error", jobId, error: "Failed to finalize PDF job" };
+}
+
+async function runPdfWorkerTick() {
+  if (!pdfWorkerRunning || pdfWorkerBusy) return;
+  pdfWorkerBusy = true;
+  try {
+    await processOnePdfJob();
+  } catch (err) {
+    writeSyncLog({
+      ts: new Date().toISOString(),
+      level: "error",
+      event: "pdf_worker_tick_error",
+      error: err && err.message ? err.message : String(err),
+    });
+  } finally {
+    pdfWorkerBusy = false;
+    if (pdfWorkerRunning) {
+      pdfWorkerTimer = setTimeout(runPdfWorkerTick, PDF_WORKER_POLL_MS);
+    }
+  }
+}
+
+function startPdfWorker(reason = "manual") {
+  if (!ENABLE_PDF_WORKER || pdfWorkerRunning) return;
+  pdfWorkerRunning = true;
+  writeSyncLog({
+    ts: new Date().toISOString(),
+    level: "info",
+    event: "pdf_worker_start",
+    reason,
+    pollMs: PDF_WORKER_POLL_MS,
+  });
+  pdfWorkerTimer = setTimeout(runPdfWorkerTick, PDF_WORKER_POLL_MS);
+}
+
+function stopPdfWorker(reason = "manual") {
+  if (!pdfWorkerRunning && !pdfWorkerTimer) return;
+  pdfWorkerRunning = false;
+  if (pdfWorkerTimer) {
+    clearTimeout(pdfWorkerTimer);
+    pdfWorkerTimer = null;
+  }
+  writeSyncLog({
+    ts: new Date().toISOString(),
+    level: "info",
+    event: "pdf_worker_stop",
+    reason,
+  });
+}
+
+function getPdfWorkerStatus() {
+  return {
+    enabled: ENABLE_PDF_WORKER,
+    running: pdfWorkerRunning,
+    busy: pdfWorkerBusy,
+    pollMs: PDF_WORKER_POLL_MS,
+    claimPath: PDF_JOB_CLAIM_PATH,
+    backendBaseUrl: BACKEND_BASE_URL,
+    hasIdToken: Boolean(currentIdToken),
+    userUid: currentUserUid || null,
+    companyId: resolveCompanyId() || null,
+  };
+}
+
 
 
 
@@ -1394,8 +2478,22 @@ ipcMain.handle("get-sync-window-preview", async (event, data) => {
   }
 });
 
+ipcMain.handle("get-pdf-worker-status", async () => {
+  return { status: "ok", worker: getPdfWorkerStatus() };
+});
+
+ipcMain.handle("run-pdf-worker-once", async () => {
+  try {
+    const result = await processOnePdfJob();
+    return { status: "ok", result };
+  } catch (err) {
+    return { status: "error", message: err.message };
+  }
+});
+
 ipcMain.handle("logout", async () => {
   try {
+    stopPdfWorker("logout");
     try {
       await firebase.auth().signOut();
     } catch (e) {}
