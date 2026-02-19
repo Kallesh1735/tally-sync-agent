@@ -2184,8 +2184,6 @@ function extractInvoicesFromTallyXML(xml, options = {}) {
   const stats = {
     voucherCount: vouchers.length,
     salesVoucherCount: 0,
-    purchaseVoucherCount: 0,
-    selectedVoucherCount: 0,
     skippedNoCustomer: 0,
   };
 
@@ -2349,21 +2347,13 @@ function extractInvoicesFromTallyXML(xml, options = {}) {
   // Process each voucher
   // -----------------------------
   for (const v of vouchers) {
-    const voucherTypeName = String(
+    const voucherType = String(
       getVal(v, "VOUCHERTYPENAME") || getVal(v, "VCHTYPE") || ""
-    ).trim();
-    const voucherType = voucherTypeName.toUpperCase();
-    const isSales = voucherType.includes("SALE");
-    const isPurchase = voucherType.includes("PURCHASE");
+    ).toUpperCase();
 
-    // Accept sales + purchase vouchers.
-    if (!isSales && !isPurchase) continue;
-    if (isSales) stats.salesVoucherCount += 1;
-    if (isPurchase) stats.purchaseVoucherCount += 1;
-    stats.selectedVoucherCount += 1;
-
-    const transactionType = isPurchase ? "PURCHASE" : "SALES";
-    const flowType = isPurchase ? "PAYABLE" : "RECEIVABLE";
+    // Accept only Sales, SALES GST, etc.
+    if (!voucherType.includes("SALE")) continue;
+    stats.salesVoucherCount += 1;
 
     const invoiceNo = getVal(v, "VOUCHERNUMBER")
       ? String(getVal(v, "VOUCHERNUMBER"))
@@ -2554,12 +2544,8 @@ function extractInvoicesFromTallyXML(xml, options = {}) {
     invoices.push({
       source: "TALLY",
       sourceId,
-      voucherTypeName: voucherTypeName || null,
-      transactionType,
-      flowType,
       invoiceNo,
       invoiceDate,
-      partyName: customerName,
       customerName,
       totalAmount,
       outstandingAmount,
