@@ -781,9 +781,6 @@ function fetchSalesVouchersFromTally(options = {}) {
     const SVFROMDATE = formatYMD(syncWindow.fromDate);
     const SVTODATE = formatYMD(syncWindow.toDate);
 
-    console.log("Date range:", SVFROMDATE, "to", SVTODATE);
-    console.log("Company hint:", companyName || "AUTO_ACTIVE");
-
     const buildXml = (reportName, requestCompany) => {
       const companyXml = requestCompany
         ? `\n          <SVCURRENTCOMPANY>${escapeXml(requestCompany)}</SVCURRENTCOMPANY>`
@@ -802,6 +799,7 @@ ${companyXml}
           <SVFROMDATE>${SVFROMDATE}</SVFROMDATE>
           <SVTODATE>${SVTODATE}</SVTODATE>
           <SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>
+          <EXPLODEFLAG>Yes</EXPLODEFLAG>
         </STATICVARIABLES>
       </REQUESTDESC>
     </EXPORTDATA>
@@ -849,24 +847,11 @@ ${companyXml}
           }),
         });
 
-        console.log(
-          "SENDING XML TO TALLY (len:",
-          Buffer.byteLength(xml),
-          "):\n",
-          xml
-        );
-
         const req = http.request(opts, (res) => {
           let data = "";
-          console.log("TALLY RESPONSE STATUS:", res.statusCode);
-          console.log("TALLY RESPONSE HEADERS:", res.headers);
           res.on('data', (c) => (data += c.toString()));
           res.on('end', () => {
             clearTimeout(timeoutHandle);
-            console.log(
-              "TALLY RESPONSE BODY (first 2000 chars):",
-              data.substring(0, 2000)
-            );
             resOut({
               data,
               statusCode: res.statusCode,
@@ -1026,7 +1011,6 @@ ipcMain.handle("sync-from-tally", async () => {
     });
     const xml = tallyResult.xml || "";
     const meta = tallyResult.meta || {};
-    console.log("TALLY XML RECEIVED:\n", xml.substring(0, 300));
     writeSyncLog({
       ts: new Date().toISOString(),
       level: "info",
@@ -1039,7 +1023,6 @@ ipcMain.handle("sync-from-tally", async () => {
       withStats: true,
     });
     const diagnostics = computeInvoiceDiagnostics(invoices);
-    console.log("EXTRACTED INVOICES:", invoices);
     writeSyncLog({
       ts: new Date().toISOString(),
       level: "info",
@@ -2150,28 +2133,31 @@ function getPdfWorkerStatus() {
     companyId: resolveCompanyId() || null,
   };
 }
-
-
-
-
-  function extractInvoicesFromTallyXML(xml, options = {}) {
+function extractInvoicesFromTallyXML(xml, options = {}) {
   const parser = new XMLParser({
     ignoreAttributes: false,
     attributeNamePrefix: "@_",
     parseTagValue: true,
     trimValues: true,
   });
+  const emptyStats = {
+    voucherCount: 0,
+    salesVoucherCount: 0,
+    skippedNoCustomer: 0,
+  };
 
   let json;
   try {
     json = parser.parse(xml);
   } catch (err) {
     console.error("Failed to parse Tally XML:", err.message);
-    return [];
+    return options.withStats ? { invoices: [], stats: emptyStats } : [];
   }
 
   const body = json?.ENVELOPE?.BODY;
-  if (!body) return [];
+  if (!body) {
+    return options.withStats ? { invoices: [], stats: emptyStats } : [];
+  }
 
   // -----------------------------
   // Collect all VOUCHER nodes
@@ -2198,10 +2184,10 @@ function getPdfWorkerStatus() {
   const stats = {
     voucherCount: vouchers.length,
     salesVoucherCount: 0,
+    purchaseVoucherCount: 0,
+    selectedVoucherCount: 0,
     skippedNoCustomer: 0,
   };
-
-  console.log("FOUND VOUCHERS:", vouchers.length);
 
   const invoices = [];
 
@@ -2213,17 +2199,171 @@ function getPdfWorkerStatus() {
     return null;
   };
 
+  const toArray = (value) => {
+    if (!value) return [];
+    return Array.isArray(value) ? value : [value];
+  };
+
+  const parseCreditPeriodDays = (value) => {
+    if (value === null || value === undefined) return null;
+    const raw = String(value).trim();
+    if (!raw) return null;
+
+    const dayMatch = raw.match(/(-?\d+(?:\.\d+)?)\s*day/i);
+    if (dayMatch) {
+      const parsed = Number(dayMatch[1]);
+      return Number.isFinite(parsed) ? Math.max(0, Math.round(parsed)) : null;
+    }
+
+    const plainNum = Number(raw);
+    if (Number.isFinite(plainNum)) {
+      return Math.max(0, Math.round(plainNum));
+    }
+    return null;
+  };
+
+  const parseDueDateYmd = (value) => {
+    if (value === null || value === undefined) return null;
+    const raw = String(value)
+      .replace(/[()]/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+    if (!raw) return null;
+
+    const ymd = normalizeDateToYmd(raw);
+    if (ymd) return ymd;
+    const m = raw.match(/^(\d{1,2})[-/.](\d{1,2})[-/.](\d{2,4})$/);
+    if (m) {
+      const dd = Number(m[1]);
+      const mm = Number(m[2]);
+      let yyyy = Number(m[3]);
+      if (yyyy < 100) {
+        yyyy += yyyy >= 70 ? 1900 : 2000;
+      }
+      if (!dd || !mm || !yyyy) return null;
+      const d = new Date(yyyy, mm - 1, dd);
+      if (isNaN(d.getTime())) return null;
+      return formatYMDDate(d);
+    }
+
+    const monthMatch = raw.match(
+      /^(\d{1,2})[-/. ]([A-Za-z]{3,9})[-/. ](\d{2,4})$/
+    );
+    if (monthMatch) {
+      const dd = Number(monthMatch[1]);
+      const monthRaw = monthMatch[2].toLowerCase();
+      let yyyy = Number(monthMatch[3]);
+      if (yyyy < 100) {
+        yyyy += yyyy >= 70 ? 1900 : 2000;
+      }
+      const months = {
+        jan: 0,
+        january: 0,
+        feb: 1,
+        february: 1,
+        mar: 2,
+        march: 2,
+        apr: 3,
+        april: 3,
+        may: 4,
+        jun: 5,
+        june: 5,
+        jul: 6,
+        july: 6,
+        aug: 7,
+        august: 7,
+        sep: 8,
+        sept: 8,
+        september: 8,
+        oct: 9,
+        october: 9,
+        nov: 10,
+        november: 10,
+        dec: 11,
+        december: 11,
+      };
+      const mm = months[monthRaw];
+      if (!dd || mm === undefined || !yyyy) return null;
+      const d = new Date(yyyy, mm, dd);
+      if (isNaN(d.getTime())) return null;
+      return formatYMDDate(d);
+    }
+
+    return null;
+  };
+
+  const addDaysToYmd = (ymd, days) => {
+    if (!ymd || !Number.isFinite(days)) return null;
+    const y = Number(String(ymd).slice(0, 4));
+    const m = Number(String(ymd).slice(4, 6)) - 1;
+    const d = Number(String(ymd).slice(6, 8));
+    const dt = new Date(y, m, d);
+    if (isNaN(dt.getTime())) return null;
+    dt.setDate(dt.getDate() + Math.round(days));
+    return formatYMDDate(dt);
+  };
+
+  const extractBillTermsDeep = (node) => {
+    const terms = {
+      creditPeriodDays: null,
+      dueDate: null,
+    };
+
+    const visit = (obj) => {
+      if (!obj || typeof obj !== "object") return;
+
+      if (terms.creditPeriodDays === null) {
+        terms.creditPeriodDays = parseCreditPeriodDays(
+          getVal(obj, "BILLCREDITPERIOD") ||
+            getVal(obj, "CREDITPERIOD") ||
+            getVal(obj, "BILLCREDITDAYS") ||
+            getVal(obj, "CREDITDAYS")
+        );
+      }
+
+      if (!terms.dueDate) {
+        terms.dueDate = parseDueDateYmd(
+          getVal(obj, "DUEDATE") ||
+            getVal(obj, "BILLDUEDATE") ||
+            getVal(obj, "EFFECTIVEDUEDATE")
+        );
+      }
+
+      if (terms.creditPeriodDays !== null && terms.dueDate) return;
+
+      for (const key of Object.keys(obj)) {
+        const child = obj[key];
+        if (Array.isArray(child)) {
+          for (const c of child) visit(c);
+        } else if (child && typeof child === "object") {
+          visit(child);
+        }
+      }
+    };
+
+    visit(node);
+    return terms;
+  };
+
   // -----------------------------
   // Process each voucher
   // -----------------------------
   for (const v of vouchers) {
-    const voucherType =
-      String(getVal(v, "VOUCHERTYPENAME") || getVal(v, "VCHTYPE") || "")
-        .toUpperCase();
+    const voucherTypeName = String(
+      getVal(v, "VOUCHERTYPENAME") || getVal(v, "VCHTYPE") || ""
+    ).trim();
+    const voucherType = voucherTypeName.toUpperCase();
+    const isSales = voucherType.includes("SALE");
+    const isPurchase = voucherType.includes("PURCHASE");
 
-    // ✅ Accept Sales, SALES GST, etc.
-    if (!voucherType.includes("SALE")) continue;
-    stats.salesVoucherCount += 1;
+    // Accept sales + purchase vouchers.
+    if (!isSales && !isPurchase) continue;
+    if (isSales) stats.salesVoucherCount += 1;
+    if (isPurchase) stats.purchaseVoucherCount += 1;
+    stats.selectedVoucherCount += 1;
+
+    const transactionType = isPurchase ? "PURCHASE" : "SALES";
+    const flowType = isPurchase ? "PAYABLE" : "RECEIVABLE";
 
     const invoiceNo = getVal(v, "VOUCHERNUMBER")
       ? String(getVal(v, "VOUCHERNUMBER"))
@@ -2235,7 +2375,7 @@ function getPdfWorkerStatus() {
 
     const sourceId = getVal(v, "REMOTEID") || null;
 
-    // ✅ MOST IMPORTANT LINE (THIS FIXES ABC)
+    // Prefer explicit party fields from voucher.
     let customerName =
       getVal(v, "PARTYLEDGERNAME") ||
       getVal(v, "PARTYNAME") ||
@@ -2252,6 +2392,8 @@ function getPdfWorkerStatus() {
     let outstandingAmount = 0;
     let tdsAmount = 0;
     let tcsAmount = 0;
+    let creditPeriodDays = null;
+    let dueDate = null;
 
     // -----------------------------
     // Fallback: detect party ledger ONLY if missing
@@ -2282,6 +2424,97 @@ function getPdfWorkerStatus() {
       if (amount < 0) totalAmount += Math.abs(amount);
       if (upper.includes("TDS")) tdsAmount += Math.abs(amount);
       if (upper.includes("TCS")) tcsAmount += Math.abs(amount);
+
+      const billAllocEntries = toArray(
+        e["BILLALLOCATIONS.LIST"] || e.BILLALLOCATIONS
+      );
+      for (const b of billAllocEntries) {
+        if (creditPeriodDays === null) {
+          creditPeriodDays = parseCreditPeriodDays(
+            getVal(b, "BILLCREDITPERIOD") ||
+              getVal(b, "CREDITPERIOD") ||
+              getVal(b, "BILLCREDITDAYS")
+          );
+        }
+        if (!dueDate) {
+          dueDate = parseDueDateYmd(
+            getVal(b, "DUEDATE") ||
+              getVal(b, "BILLDUEDATE") ||
+              getVal(b, "DATE")
+          );
+        }
+      }
+
+      const accountingAllocEntries = toArray(
+        e["ACCOUNTINGALLOCATIONS.LIST"] || e.ACCOUNTINGALLOCATIONS
+      );
+      for (const a of accountingAllocEntries) {
+        if (creditPeriodDays === null) {
+          creditPeriodDays = parseCreditPeriodDays(
+            getVal(a, "BILLCREDITPERIOD") ||
+              getVal(a, "CREDITPERIOD") ||
+              getVal(a, "BILLCREDITDAYS") ||
+              getVal(a, "CREDITDAYS")
+          );
+        }
+        if (!dueDate) {
+          dueDate = parseDueDateYmd(
+            getVal(a, "DUEDATE") ||
+              getVal(a, "BILLDUEDATE") ||
+              getVal(a, "EFFECTIVEDUEDATE")
+          );
+        }
+
+        const nestedBillAlloc = toArray(
+          a["BILLALLOCATIONS.LIST"] || a.BILLALLOCATIONS
+        );
+        for (const b of nestedBillAlloc) {
+          if (creditPeriodDays === null) {
+            creditPeriodDays = parseCreditPeriodDays(
+              getVal(b, "BILLCREDITPERIOD") ||
+                getVal(b, "CREDITPERIOD") ||
+                getVal(b, "BILLCREDITDAYS") ||
+                getVal(b, "CREDITDAYS")
+            );
+          }
+          if (!dueDate) {
+            dueDate = parseDueDateYmd(
+              getVal(b, "DUEDATE") ||
+                getVal(b, "BILLDUEDATE") ||
+                getVal(b, "EFFECTIVEDUEDATE")
+            );
+          }
+        }
+      }
+    }
+
+    if (creditPeriodDays === null) {
+      creditPeriodDays = parseCreditPeriodDays(
+        getVal(v, "BILLCREDITPERIOD") ||
+          getVal(v, "CREDITPERIOD") ||
+          getVal(v, "BILLCREDITDAYS")
+      );
+    }
+
+    if (!dueDate) {
+      dueDate = parseDueDateYmd(
+        getVal(v, "DUEDATE") ||
+          getVal(v, "BILLDUEDATE")
+      );
+    }
+
+    if (creditPeriodDays === null || !dueDate) {
+      const deepTerms = extractBillTermsDeep(v);
+      if (creditPeriodDays === null) {
+        creditPeriodDays = deepTerms.creditPeriodDays;
+      }
+      if (!dueDate) {
+        dueDate = deepTerms.dueDate;
+      }
+    }
+
+    if (!dueDate && creditPeriodDays !== null && invoiceDate) {
+      dueDate = addDaysToYmd(invoiceDate, creditPeriodDays);
     }
 
     if (!customerName) {
@@ -2317,23 +2550,23 @@ function getPdfWorkerStatus() {
         ? "PARTIALLY_PAID"
 
         : "UNPAID";
-    console.log(
-      "FINAL CUSTOMER:",
-      customerName,
-      "Invoice:",
-      invoiceNo
-    );
 
     invoices.push({
       source: "TALLY",
       sourceId,
+      voucherTypeName: voucherTypeName || null,
+      transactionType,
+      flowType,
       invoiceNo,
       invoiceDate,
+      partyName: customerName,
       customerName,
       totalAmount,
       outstandingAmount,
       tdsAmount: tdsAmount || null,
       tcsAmount: tcsAmount || null,
+      creditPeriodDays: creditPeriodDays !== null ? creditPeriodDays : null,
+      dueDate: dueDate || null,
       invoiceStatus,
       items,
       lastSyncedAt: new Date().toISOString(),
@@ -2342,11 +2575,6 @@ function getPdfWorkerStatus() {
 
   return options.withStats ? { invoices, stats } : invoices;
 }
-
-
-  // Print all extracted customer names for debug
-  
-
 // -----------------------------
 // Multi-method sync: LIVE | FOLDER
 // -----------------------------
