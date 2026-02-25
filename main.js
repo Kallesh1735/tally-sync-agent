@@ -2203,6 +2203,35 @@ function extractInvoicesFromTallyXML(xml, options = {}) {
     return Array.isArray(value) ? value : [value];
   };
 
+  const parseAmountValue = (value) => {
+    if (value === null || value === undefined || value === "") return 0;
+    if (typeof value === "number") return Number.isFinite(value) ? value : 0;
+
+    const raw = String(value).trim();
+    if (!raw) return 0;
+
+    const upper = raw.toUpperCase();
+    const isCr = /\bCR\b/.test(upper);
+    const isDr = /\bDR\b/.test(upper);
+    const hasParens = raw.includes("(") && raw.includes(")");
+
+    const numeric = raw
+      .replace(/[(),]/g, "")
+      .replace(/\bDR\b/gi, "")
+      .replace(/\bCR\b/gi, "")
+      .replace(/[^\d+-.]/g, "")
+      .trim();
+
+    const parsed = Number(numeric);
+    if (!Number.isFinite(parsed)) return 0;
+
+    if (hasParens || isCr) return -Math.abs(parsed);
+    if (isDr) return Math.abs(parsed);
+    return parsed;
+  };
+
+  const round2 = (num) => Math.round((Number(num) + Number.EPSILON) * 100) / 100;
+
   const parseCreditPeriodDays = (value) => {
     if (value === null || value === undefined) return null;
     const raw = String(value).trim();
@@ -2385,34 +2414,41 @@ function extractInvoicesFromTallyXML(xml, options = {}) {
     let tcsAmount = 0;
     let creditPeriodDays = null;
     let dueDate = null;
-
+    let partyLedgerAmountAbs = 0;
+    let partyOutstandingAmountAbs = 0;
+    let fallbackNegativeTotal = 0;
     // -----------------------------
     // Fallback: detect party ledger ONLY if missing
     // -----------------------------
-    if (!customerName) {
-      for (const e of ledgerEntries) {
-        const ledgerName = getVal(e, "LEDGERNAME");
-        const amount = Number(getVal(e, "AMOUNT") || 0);
-        const isParty =
-          String(getVal(e, "ISPARTYLEDGER") || "").toLowerCase() === "yes";
-
-        if (isParty && ledgerName) {
-          customerName = ledgerName;
-          outstandingAmount = Math.abs(amount);
-          break;
-        }
-      }
-    }
+    // Customer may be set from ISPARTYLEDGER entry while iterating ledgers below.
 
     // -----------------------------
     // Totals & taxes
     // -----------------------------
     for (const e of ledgerEntries) {
       const ledgerName = getVal(e, "LEDGERNAME");
-      const amount = Number(getVal(e, "AMOUNT") || 0);
+      const amount = parseAmountValue(getVal(e, "AMOUNT"));
       const upper = String(ledgerName || "").toUpperCase();
+      const normalizedCustomerName = customerName
+        ? String(customerName).trim().toUpperCase()
+        : "";
+      const isPartyFlag =
+        String(getVal(e, "ISPARTYLEDGER") || "").toLowerCase() === "yes";
+      const isPartyByName =
+        normalizedCustomerName &&
+        String(ledgerName || "")
+          .trim()
+          .toUpperCase() === normalizedCustomerName;
+      const isPartyEntry = isPartyFlag || isPartyByName;
 
-      if (amount < 0) totalAmount += Math.abs(amount);
+      if (!customerName && isPartyFlag && ledgerName) {
+        customerName = ledgerName;
+      }
+
+      if (amount < 0) fallbackNegativeTotal += Math.abs(amount);
+      if (isPartyEntry) {
+        partyLedgerAmountAbs = Math.max(partyLedgerAmountAbs, Math.abs(amount));
+      }
       if (upper.includes("TDS")) tdsAmount += Math.abs(amount);
       if (upper.includes("TCS")) tcsAmount += Math.abs(amount);
 
@@ -2433,6 +2469,15 @@ function extractInvoicesFromTallyXML(xml, options = {}) {
               getVal(b, "BILLDUEDATE") ||
               getVal(b, "DATE")
           );
+        }
+
+        if (isPartyEntry) {
+          const billAmount = parseAmountValue(
+            getVal(b, "AMOUNT") ||
+              getVal(b, "BILLAMOUNT") ||
+              getVal(b, "BILLCLOSING")
+          );
+          partyOutstandingAmountAbs += Math.abs(billAmount);
         }
       }
 
@@ -2474,6 +2519,15 @@ function extractInvoicesFromTallyXML(xml, options = {}) {
                 getVal(b, "BILLDUEDATE") ||
                 getVal(b, "EFFECTIVEDUEDATE")
             );
+          }
+
+          if (isPartyEntry) {
+            const billAmount = parseAmountValue(
+              getVal(b, "AMOUNT") ||
+                getVal(b, "BILLAMOUNT") ||
+                getVal(b, "BILLCLOSING")
+            );
+            partyOutstandingAmountAbs += Math.abs(billAmount);
           }
         }
       }
@@ -2531,13 +2585,51 @@ function extractInvoicesFromTallyXML(xml, options = {}) {
       itemName: getVal(i, "STOCKITEMNAME") || null,
       quantity: getVal(i, "BILLEDQTY") || null,
       rate: getVal(i, "RATE") || null,
-      amount: Number(getVal(i, "AMOUNT") || 0),
+      amount: parseAmountValue(getVal(i, "AMOUNT")),
     }));
 
+    const itemsTotalAbs = round2(
+      items.reduce((sum, item) => sum + Math.abs(parseAmountValue(item.amount)), 0)
+    );
+    const voucherTotalAbs = Math.abs(
+      parseAmountValue(
+        getVal(v, "VOUCHERTOTAL") ||
+          getVal(v, "NETAMOUNT") ||
+          getVal(v, "AMOUNT")
+      )
+    );
+
+    if (partyLedgerAmountAbs > 0) {
+      totalAmount = partyLedgerAmountAbs;
+    } else if (voucherTotalAbs > 0) {
+      totalAmount = voucherTotalAbs;
+    } else if (itemsTotalAbs > 0) {
+      totalAmount = itemsTotalAbs;
+    } else {
+      totalAmount = fallbackNegativeTotal;
+    }
+
+    if (partyOutstandingAmountAbs > 0) {
+      outstandingAmount = partyOutstandingAmountAbs;
+    } else if (partyLedgerAmountAbs > 0) {
+      outstandingAmount = partyLedgerAmountAbs;
+    } else {
+      // Conservative fallback when Tally doesn't provide bill allocations.
+      outstandingAmount = totalAmount;
+    }
+
+    totalAmount = round2(totalAmount);
+    outstandingAmount = round2(outstandingAmount);
+    tdsAmount = round2(tdsAmount);
+    tcsAmount = round2(tcsAmount);
+
+    if (Math.abs(totalAmount) < 0.01) totalAmount = 0;
+    if (Math.abs(outstandingAmount) < 0.01) outstandingAmount = 0;
+
     const invoiceStatus =
-      outstandingAmount === 0
+      outstandingAmount <= 0
         ? "PAID"
-        : outstandingAmount < totalAmount
+        : totalAmount > 0 && outstandingAmount < totalAmount
         ? "PARTIALLY_PAID"
 
         : "UNPAID";
