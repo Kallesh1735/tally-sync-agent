@@ -1,4 +1,4 @@
-// main.js
+﻿// main.js
 // Electron main process
 // - Creates app window
 // - Handles Firebase login + token persistence
@@ -14,6 +14,7 @@ const DEFAULT_BACKEND_BASE_URL = "https://giro-pie-frontend.vercel.app";
 
 function parseBooleanEnv(value, defaultValue = false) {
   if (value === undefined || value === null || value === "") {
+    return defaultValue;
     return defaultValue;
   }
   const normalized = String(value).trim().toLowerCase();

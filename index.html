@@ -9,13 +9,49 @@
   <body>
     <div class="container">
       <!-- Header -->
-      <header class="header">
+      <header id="appHeader" class="header">
         <h1>GIROPie Tally Agent</h1>
         <p class="subtitle">Sync invoices from Tally Prime</p>
       </header>
 
+      <!-- Screen 0: Welcome -->
+      <div id="screen-welcome" class="screen">
+        <div class="card welcome-card">
+          <div class="welcome-orb" aria-hidden="true">
+            <span class="orb-core">&#8635;</span>
+            <span class="orb-dot orb-dot-a"></span>
+            <span class="orb-dot orb-dot-b"></span>
+          </div>
+          <h2 class="welcome-title">Welcome to GIROPie Tally Agent</h2>
+          <p class="welcome-subtitle">Secure invoice sync from Tally Prime to Giropie in a few clicks.</p>
+          <div class="brand-flow welcome-flow" aria-hidden="true">
+            <div class="brand-pill tally">
+              <span class="brand-logo-wrap">
+                <img class="brand-logo" src="assets/tally-prime-logo.png" alt="Tally" />
+              </span>
+              <span class="brand-text">Tally</span>
+            </div>
+            <div class="brand-bridge">
+              <span class="flow-dot"></span>
+              <span class="flow-line"></span>
+              <span class="flow-arrow">&#10132;</span>
+            </div>
+            <div class="brand-pill giropie">
+              <span class="brand-logo-wrap">
+                <img class="brand-logo" src="assets/giropie-logo.png" alt="Giropie" />
+              </span>
+              <span class="brand-text">Giropie</span>
+            </div>
+          </div>
+          <button id="welcomeProceedBtn" class="btn btn-primary welcome-proceed-btn" type="button">
+            <span>Proceed</span>
+            <span class="arrow" aria-hidden="true">&#10132;</span>
+          </button>
+        </div>
+      </div>
+
       <!-- Screen 1: Login -->
-      <div id="screen-login" class="screen">
+      <div id="screen-login" class="screen" style="display:none;">
         <div class="card">
           <div class="brand-flow" aria-hidden="true">
             <div class="brand-pill tally">

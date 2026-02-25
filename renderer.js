@@ -1,13 +1,19 @@
 // renderer.js - UI flow for Login -> Method Selection -> Sync
 
 function showScreen(id) {
-  ["screen-login", "screen-method", "screen-sync"].forEach((s) => {
+  ["screen-welcome", "screen-login", "screen-method", "screen-sync"].forEach((s) => {
     const el = document.getElementById(s);
     if (el) el.style.display = s === id ? "" : "none";
   });
+
+  const appHeader = document.getElementById("appHeader");
+  if (appHeader) {
+    appHeader.style.display = id === "screen-welcome" ? "none" : "";
+  }
 }
 
 document.addEventListener("DOMContentLoaded", () => {
+  const welcomeProceedBtn = document.getElementById("welcomeProceedBtn");
   const emailInput = document.getElementById("email");
   const passInput = document.getElementById("password");
   const loginBtn = document.getElementById("loginBtn");
@@ -31,7 +37,7 @@ document.addEventListener("DOMContentLoaded", () => {
   const lastPayloadCount = document.getElementById("lastPayloadCount");
   const lastTotalAmount = document.getElementById("lastTotalAmount");
 
-  showScreen("screen-login");
+  showScreen("screen-welcome");
 
   function refreshAuthHint() {
     if (!companyHint) return;
@@ -105,6 +111,12 @@ document.addEventListener("DOMContentLoaded", () => {
   refreshAuthHint();
   refreshLastSyncSummary();
   refreshSyncWindowPreview();
+
+  if (welcomeProceedBtn) {
+    welcomeProceedBtn.addEventListener("click", () => {
+      showScreen("screen-login");
+    });
+  }
 
   if (loginBtn) {
     loginBtn.addEventListener("click", async () => {

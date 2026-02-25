@@ -140,6 +140,120 @@ a:hover {
   margin-bottom: 16px;
 }
 
+/* Welcome */
+.welcome-card {
+  position: relative;
+  overflow: hidden;
+  text-align: center;
+  padding-top: 34px;
+}
+
+.welcome-orb {
+  position: relative;
+  overflow: visible;
+  width: 132px;
+  height: 132px;
+  margin: 0 auto 14px;
+  border-radius: 50%;
+  background:
+    radial-gradient(circle at 34% 26%, rgba(255, 255, 255, 0.45), transparent 38%),
+    linear-gradient(145deg, rgba(56, 189, 248, 0.95), rgba(14, 165, 164, 0.72) 56%, rgba(245, 158, 11, 0.82));
+  box-shadow:
+    inset 0 0 0 1px rgba(255, 255, 255, 0.12),
+    0 12px 30px rgba(2, 6, 23, 0.45),
+    0 0 38px rgba(56, 189, 248, 0.32);
+  animation: orbPulse 2.6s ease-in-out infinite;
+}
+
+.welcome-orb::before {
+  content: "";
+  position: absolute;
+  inset: -8px;
+  border-radius: 50%;
+  border: 2px solid rgba(56, 189, 248, 0.35);
+  box-shadow: 0 0 18px rgba(56, 189, 248, 0.35);
+  animation: orbRingPulse 1.9s ease-in-out infinite;
+}
+
+.welcome-orb::after {
+  content: "";
+  position: absolute;
+  inset: -20px;
+  border-radius: 50%;
+  border: 1px dashed rgba(255, 255, 255, 0.22);
+  animation: orbSpin 9s linear infinite;
+}
+
+.orb-core {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  font-size: 2.2rem;
+  color: rgba(255, 255, 255, 0.9);
+  text-shadow: 0 0 12px rgba(255, 255, 255, 0.35);
+  animation: coreSpin 3.8s linear infinite;
+}
+
+.orb-dot {
+  position: absolute;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  box-shadow: 0 0 10px currentColor;
+}
+
+.orb-dot-a {
+  top: -6px;
+  left: 50%;
+  margin-left: -6px;
+  color: #38bdf8;
+  background: currentColor;
+  animation: dotOrbit 4s linear infinite;
+}
+
+.orb-dot-b {
+  bottom: -6px;
+  left: 50%;
+  margin-left: -6px;
+  color: #f59e0b;
+  background: currentColor;
+  animation: dotOrbit 4s linear infinite reverse;
+}
+
+.welcome-title {
+  margin: 0;
+  font-size: 1.4rem;
+  font-weight: 700;
+  letter-spacing: 0.2px;
+}
+
+.welcome-subtitle {
+  margin: 10px auto 16px;
+  color: var(--text-3);
+  font-size: 0.92rem;
+  max-width: 320px;
+  line-height: 1.4;
+}
+
+.welcome-flow {
+  margin: 8px auto 22px;
+}
+
+.welcome-proceed-btn {
+  min-width: 180px;
+  gap: 10px;
+}
+
+.welcome-proceed-btn .arrow {
+  font-size: 1.05rem;
+  transition: transform 0.2s ease;
+}
+
+.welcome-proceed-btn:hover .arrow {
+  transform: translateX(2px);
+}
+
 /* Brand flow */
 .brand-flow {
   display: grid;
@@ -501,6 +615,63 @@ a:hover {
   }
 }
 
+@keyframes orbPulse {
+  0%,
+  100% {
+    transform: scale(1);
+    box-shadow:
+      inset 0 0 0 1px rgba(255, 255, 255, 0.12),
+      0 12px 30px rgba(2, 6, 23, 0.45),
+      0 0 32px rgba(56, 189, 248, 0.3);
+  }
+  50% {
+    transform: scale(1.04);
+    box-shadow:
+      inset 0 0 0 1px rgba(255, 255, 255, 0.16),
+      0 15px 36px rgba(2, 6, 23, 0.5),
+      0 0 44px rgba(56, 189, 248, 0.44);
+  }
+}
+
+@keyframes orbSpin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes orbRingPulse {
+  0%,
+  100% {
+    transform: scale(1);
+    opacity: 0.7;
+  }
+  50% {
+    transform: scale(1.05);
+    opacity: 1;
+  }
+}
+
+@keyframes coreSpin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes dotOrbit {
+  from {
+    transform: rotate(0deg) translateY(-76px) rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg) translateY(-76px) rotate(-360deg);
+  }
+}
+
 @media (max-width: 520px) {
   body {
     padding: 16px;
@@ -512,6 +683,14 @@ a:hover {
 
   .header h1 {
     font-size: 1.6rem;
+  }
+
+  .welcome-title {
+    font-size: 1.18rem;
+  }
+
+  .welcome-subtitle {
+    font-size: 0.86rem;
   }
 
   .method-card {
