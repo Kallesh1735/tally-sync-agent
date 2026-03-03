@@ -78,8 +78,13 @@ let currentUserEmail = null;
 const SYNC_LOG_PREFIX = "sync-";
 const TALLY_REQUEST_TIMEOUT_MS = Number(process.env.TALLY_TIMEOUT_MS || 45000);
 const BACKEND_REQUEST_TIMEOUT_MS = Number(process.env.BACKEND_TIMEOUT_MS || 30000);
-const TALLY_REQUEST_RETRIES = Number(process.env.TALLY_RETRY_COUNT || 1);
+const TALLY_REQUEST_RETRIES = Number(process.env.TALLY_RETRY_COUNT || 0);
 const TALLY_RETRY_DELAY_MS = Number(process.env.TALLY_RETRY_DELAY_MS || 1500);
+const TALLY_REPORT_ORDER = (process.env.TALLY_REPORT_ORDER ||
+  "Day Book,Vouchers,Voucher Register (Sales),Voucher Register")
+  .split(",")
+  .map((x) => x.trim())
+  .filter(Boolean);
 const SYNC_MODE = (process.env.SYNC_MODE || "incremental").toLowerCase();
 const SYNC_LOOKBACK_DAYS = Number(process.env.SYNC_LOOKBACK_DAYS || 30);
 const SYNC_OVERLAP_DAYS = Number(process.env.SYNC_OVERLAP_DAYS || 1);
@@ -119,6 +124,7 @@ console.log(
   `TALLY_RETRY_COUNT=${TALLY_REQUEST_RETRIES}`,
   `TALLY_RETRY_DELAY_MS=${TALLY_RETRY_DELAY_MS}`
 );
+console.log("Tally reports:", TALLY_REPORT_ORDER.join(" -> "));
 console.log(
   "Sync window:",
   `SYNC_MODE=${SYNC_MODE}`,
@@ -809,12 +815,14 @@ ${companyXml}
 `;
     };
 
-    const tryReports = [
-      "Voucher Register",
-      "Vouchers",
-      "Voucher Register (Sales)",
-      "Day Book",
-    ];
+    const tryReports = TALLY_REPORT_ORDER.length
+      ? [...TALLY_REPORT_ORDER]
+      : [
+          "Day Book",
+          "Vouchers",
+          "Voucher Register (Sales)",
+          "Voucher Register",
+        ];
 
     const metaBase = {
       fromDate: SVFROMDATE,
@@ -937,6 +945,14 @@ ${companyXml}
               r,
               err && err.message
             );
+            const isTimeout = /timed out/i.test(String(err && err.message));
+            // If a remembered company hint is stale, fail over quickly to active company context.
+            if (isTimeout && requestCompany && !envCompany) {
+              console.warn(
+                "Tally timeout with company hint. Falling back to active company context."
+              );
+              break;
+            }
           }
         }
       }
