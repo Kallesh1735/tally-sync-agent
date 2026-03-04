@@ -112,10 +112,36 @@ const PDF_STRICT_TALLY_LAYOUT = parseBooleanEnv(
   process.env.PDF_STRICT_TALLY_LAYOUT,
   true
 );
+const ENABLE_UTR_WRITEBACK_WORKER = parseBooleanEnv(
+  process.env.ENABLE_UTR_WRITEBACK_WORKER,
+  false
+);
+const UTR_WRITEBACK_POLL_MS = Number(process.env.UTR_WRITEBACK_POLL_MS || 5000);
+const UTR_JOB_CLAIM_PATH =
+  process.env.UTR_JOB_CLAIM_PATH || "/api/agent/payment-writeback-jobs/claim";
+const UTR_JOB_COMPLETE_PATH =
+  process.env.UTR_JOB_COMPLETE_PATH ||
+  "/api/agent/payment-writeback-jobs/:jobId/complete";
+const UTR_JOB_FAIL_PATH =
+  process.env.UTR_JOB_FAIL_PATH || "/api/agent/payment-writeback-jobs/:jobId/fail";
+const UTR_TALLY_TIMEOUT_MS = Number(
+  process.env.UTR_TALLY_TIMEOUT_MS || TALLY_REQUEST_TIMEOUT_MS
+);
+const UTR_WRITEBACK_DRY_RUN = parseBooleanEnv(
+  process.env.UTR_WRITEBACK_DRY_RUN,
+  false
+);
+const DEFAULT_RECEIPT_VOUCHER_TYPE =
+  process.env.UTR_RECEIPT_VOUCHER_TYPE || "Receipt";
+const DEFAULT_RECEIPT_BANK_LEDGER =
+  process.env.UTR_RECEIPT_BANK_LEDGER || "HDFC Bank";
 
 let pdfWorkerTimer = null;
 let pdfWorkerRunning = false;
 let pdfWorkerBusy = false;
+let utrWorkerTimer = null;
+let utrWorkerRunning = false;
+let utrWorkerBusy = false;
 
 console.log(
   "Timeouts:",
@@ -141,6 +167,15 @@ console.log(
   `PDF_JOB_CLAIM_PATH=${PDF_JOB_CLAIM_PATH}`,
   `PDF_TALLY_TIMEOUT_MS=${PDF_TALLY_REQUEST_TIMEOUT_MS}`,
   `PDF_STRICT_TALLY_LAYOUT=${PDF_STRICT_TALLY_LAYOUT}`
+);
+console.log(
+  "UTR worker:",
+  `ENABLE_UTR_WRITEBACK_WORKER=${ENABLE_UTR_WRITEBACK_WORKER}`,
+  `UTR_WRITEBACK_POLL_MS=${UTR_WRITEBACK_POLL_MS}`,
+  `UTR_JOB_CLAIM_PATH=${UTR_JOB_CLAIM_PATH}`,
+  `UTR_TALLY_TIMEOUT_MS=${UTR_TALLY_TIMEOUT_MS}`,
+  `UTR_WRITEBACK_DRY_RUN=${UTR_WRITEBACK_DRY_RUN}`,
+  `UTR_RECEIPT_VOUCHER_TYPE=${DEFAULT_RECEIPT_VOUCHER_TYPE}`
 );
 
 function delay(ms) {
@@ -696,6 +731,7 @@ app.whenReady().then(() => {
   createWindow();
   if (currentIdToken) {
     startPdfWorker("app_ready_with_saved_session");
+    startUtrWritebackWorker("app_ready_with_saved_session");
   }
 });
 
@@ -709,6 +745,7 @@ app.on("activate", () => {
 
 app.on("before-quit", () => {
   stopPdfWorker("app_quit");
+  stopUtrWritebackWorker("app_quit");
 });
 
 // -----------------------------
@@ -755,6 +792,7 @@ ipcMain.handle("login", async (event, creds) => {
 
     saveAuthToDisk();
     startPdfWorker("login_success");
+    startUtrWritebackWorker("login_success");
 
     console.log("Login successful: Firebase user authenticated");
     return { status: "ok" };
@@ -1146,7 +1184,7 @@ function buildBackendUrl(apiPath) {
 function resolvePathWithJobId(pathTemplate, jobId) {
   const encoded = encodeURIComponent(String(jobId || "").trim());
   if (!encoded) {
-    throw new Error("Missing PDF job id");
+    throw new Error("Missing job id");
   }
   if (pathTemplate.includes(":jobId")) {
     return pathTemplate.replace(":jobId", encoded);
@@ -1422,6 +1460,33 @@ function buildTallyDateVariants(rawDate) {
   const ddmmyyyy = ymdToDdMmYyyy(ymd);
   if (ddmmyyyy) variants.push(ddmmyyyy);
   return [...new Set(variants.filter(Boolean))];
+}
+
+function parseMoneyAmount(value) {
+  if (value === null || value === undefined || value === "") return 0;
+  if (typeof value === "number") return Number.isFinite(value) ? value : 0;
+
+  const raw = String(value).trim();
+  if (!raw) return 0;
+  const numeric = raw
+    .replace(/[(),]/g, "")
+    .replace(/\bDR\b/gi, "")
+    .replace(/\bCR\b/gi, "")
+    .replace(/[^\d+-.]/g, "")
+    .trim();
+  const n = Number(numeric);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function formatAmountForTally(value) {
+  const n = Math.abs(parseMoneyAmount(value));
+  return (Math.round((n + Number.EPSILON) * 100) / 100).toFixed(2);
+}
+
+function normalizeDisplayValue(value) {
+  if (value === null || value === undefined) return null;
+  const str = String(value).trim().replace(/\s+/g, " ");
+  return str || null;
 }
 
 function parseIdentityKey(identityKey) {
@@ -2150,6 +2215,504 @@ function getPdfWorkerStatus() {
     companyId: resolveCompanyId() || null,
   };
 }
+
+async function claimNextUtrWritebackJob() {
+  const companyId = resolveCompanyId();
+  writeSyncLog({
+    ts: new Date().toISOString(),
+    level: "info",
+    event: "utr_claim_request",
+    companyId: companyId || null,
+    path: UTR_JOB_CLAIM_PATH,
+  });
+  const res = await requestBackendJson(buildBackendUrl(UTR_JOB_CLAIM_PATH), {
+    method: "POST",
+    payload: {
+      companyId: companyId || null,
+      jobType: "UTR_WRITEBACK",
+      agent: {
+        name: "giropie-tally-agent",
+        version: app.getVersion(),
+        platform: process.platform,
+      },
+    },
+    timeoutMs: PDF_JOB_REQUEST_TIMEOUT_MS,
+  });
+  writeSyncLog({
+    ts: new Date().toISOString(),
+    level: "info",
+    event: "utr_claim_response",
+    statusCode: res.statusCode,
+    body: summarizeResponseBody(res.body || res.rawBody),
+  });
+
+  if (res.statusCode === 204 || !res.body) return null;
+  const body = res.body;
+  if (body.status === "empty" || body.job === null) return null;
+  if (body.job && typeof body.job === "object") return body.job;
+  if (body.id || body.jobId) return body;
+  return null;
+}
+
+async function markUtrJobComplete(jobId, payload) {
+  const pathWithId = resolvePathWithJobId(UTR_JOB_COMPLETE_PATH, jobId);
+  writeSyncLog({
+    ts: new Date().toISOString(),
+    level: "info",
+    event: "utr_complete_request",
+    jobId,
+    path: pathWithId,
+    payloadInfo: {
+      writtenUtr:
+        payload && (payload.writtenUtr || payload.utrNumber)
+          ? String(payload.writtenUtr || payload.utrNumber)
+          : null,
+      tallyReceiptRef:
+        payload && payload.tallyReceiptRef ? String(payload.tallyReceiptRef) : null,
+      dryRun: Boolean(payload && payload.dryRun),
+    },
+  });
+  const res = await requestBackendJson(buildBackendUrl(pathWithId), {
+    method: "POST",
+    payload,
+    timeoutMs: PDF_JOB_REQUEST_TIMEOUT_MS,
+  });
+  writeSyncLog({
+    ts: new Date().toISOString(),
+    level: "info",
+    event: "utr_complete_response",
+    jobId,
+    statusCode: res.statusCode,
+    body: summarizeResponseBody(res.body || res.rawBody),
+  });
+  return res;
+}
+
+async function markUtrJobFailed(jobId, errorMessage) {
+  const pathWithId = resolvePathWithJobId(UTR_JOB_FAIL_PATH, jobId);
+  const payload = { error: String(errorMessage || "Unknown UTR writeback error") };
+  writeSyncLog({
+    ts: new Date().toISOString(),
+    level: "error",
+    event: "utr_fail_request",
+    jobId,
+    path: pathWithId,
+    payload,
+  });
+  const res = await requestBackendJson(buildBackendUrl(pathWithId), {
+    method: "POST",
+    payload,
+    timeoutMs: PDF_JOB_REQUEST_TIMEOUT_MS,
+  });
+  writeSyncLog({
+    ts: new Date().toISOString(),
+    level: "info",
+    event: "utr_fail_response",
+    jobId,
+    statusCode: res.statusCode,
+    body: summarizeResponseBody(res.body || res.rawBody),
+  });
+  return res;
+}
+
+function resolveUtrWritebackPayload(job) {
+  const jobId = String(getJobField(job, "jobId", "id") || "").trim();
+  if (!jobId) throw new Error("MATCH_FAIL: Missing jobId");
+
+  const identityFromKey = parseIdentityKey(getJobField(job, "identityKey"));
+  const customerName = normalizeDisplayValue(
+    getJobField(job, "customerName", "partyName", "ledgerName")
+  );
+  if (!customerName) {
+    throw new Error("MATCH_FAIL: Missing customerName/partyName for receipt writeback");
+  }
+
+  const invoiceNo = normalizeDisplayValue(
+    getJobField(job, "invoiceNo", "voucherNumber")
+  );
+  const invoiceDateYmd = normalizeDateToYmd(
+    getJobField(job, "invoiceDate", "invoiceDateISO", "date")
+  );
+  const sourceId = normalizeDisplayValue(
+    getJobField(job, "sourceId", "remoteId", "guid") || identityFromKey.sourceId || null
+  );
+
+  const rawAmount =
+    getJobField(
+      job,
+      "amount",
+      "paidAmount",
+      "receiptAmount",
+      "outstandingAmount",
+      "totalAmount"
+    ) || 0;
+  const parsedAmount = Math.abs(parseMoneyAmount(rawAmount));
+  if (!Number.isFinite(parsedAmount) || parsedAmount <= 0) {
+    throw new Error("MATCH_FAIL: Invalid amount for receipt writeback");
+  }
+
+  const paymentDateYmd =
+    normalizeDateToYmd(
+      getJobField(job, "paymentDate", "receiptDate", "valueDate", "txnDate")
+    ) || formatYMDDate(new Date());
+  const billRefName = normalizeDisplayValue(
+    getJobField(job, "billRefName", "billName") || invoiceNo || identityFromKey.invoiceNo
+  );
+  if (!billRefName) {
+    throw new Error("MATCH_FAIL: Missing bill reference (invoiceNo/billRefName)");
+  }
+
+  const utrNumber = normalizeDisplayValue(
+    getJobField(job, "utrNumber", "dummyUtr", "utr", "referenceNo")
+  );
+  if (!utrNumber) {
+    throw new Error("MATCH_FAIL: Missing utrNumber/dummyUtr");
+  }
+
+  const paymentId =
+    normalizeDisplayValue(
+      getJobField(job, "paymentId", "transactionId", "giropieTxnId")
+    ) || `dummy-${jobId}`;
+
+  const bankLedgerName =
+    normalizeDisplayValue(getJobField(job, "bankLedgerName", "bankLedger")) ||
+    DEFAULT_RECEIPT_BANK_LEDGER;
+  const voucherTypeName =
+    normalizeDisplayValue(getJobField(job, "receiptVoucherType", "voucherTypeName")) ||
+    DEFAULT_RECEIPT_VOUCHER_TYPE;
+  const companyNameRaw = normalizeCompanyName(
+    getJobField(job, "companyName", "tallyCompanyName")
+  );
+  const companyName = isUsableCompanyName(companyNameRaw) ? companyNameRaw : null;
+
+  const narration =
+    normalizeDisplayValue(getJobField(job, "narration")) ||
+    `GIROPIE UTR ${utrNumber} | Payment ${paymentId} | Invoice ${billRefName}`;
+
+  return {
+    jobId,
+    paymentId,
+    customerName,
+    invoiceNo: invoiceNo || null,
+    invoiceDateYmd: invoiceDateYmd || null,
+    sourceId: sourceId || null,
+    amountText: formatAmountForTally(parsedAmount),
+    amountNumber: parsedAmount,
+    paymentDateYmd,
+    billRefName,
+    utrNumber,
+    bankLedgerName,
+    voucherTypeName,
+    companyName,
+    narration,
+  };
+}
+
+function buildTallyReceiptImportXml(payload) {
+  const staticVars = buildStaticVariablesXml({
+    ...(payload.companyName ? { SVCURRENTCOMPANY: payload.companyName } : {}),
+    SVFROMDATE: payload.paymentDateYmd,
+    SVTODATE: payload.paymentDateYmd,
+  });
+
+  const bankAmount = payload.amountText;
+  const partyAmount = `-${payload.amountText}`;
+
+  return `
+<ENVELOPE>
+  <HEADER>
+    <TALLYREQUEST>Import Data</TALLYREQUEST>
+  </HEADER>
+  <BODY>
+    <IMPORTDATA>
+      <REQUESTDESC>
+        <REPORTNAME>Vouchers</REPORTNAME>
+        <STATICVARIABLES>
+${staticVars}
+        </STATICVARIABLES>
+      </REQUESTDESC>
+      <REQUESTDATA>
+        <TALLYMESSAGE xmlns:UDF="TallyUDF">
+          <VOUCHER VCHTYPE="${escapeXml(payload.voucherTypeName)}" ACTION="Create" OBJVIEW="Accounting Voucher View">
+            <DATE>${escapeXml(payload.paymentDateYmd)}</DATE>
+            <VOUCHERTYPENAME>${escapeXml(payload.voucherTypeName)}</VOUCHERTYPENAME>
+            <NARRATION>${escapeXml(payload.narration)}</NARRATION>
+            <REFERENCE>${escapeXml(payload.utrNumber)}</REFERENCE>
+            <PARTYLEDGERNAME>${escapeXml(payload.customerName)}</PARTYLEDGERNAME>
+            <PERSISTEDVIEW>Accounting Voucher View</PERSISTEDVIEW>
+            <ISINVOICE>No</ISINVOICE>
+
+            <ALLLEDGERENTRIES.LIST>
+              <LEDGERNAME>${escapeXml(payload.bankLedgerName)}</LEDGERNAME>
+              <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
+              <ISPARTYLEDGER>No</ISPARTYLEDGER>
+              <AMOUNT>${escapeXml(bankAmount)}</AMOUNT>
+            </ALLLEDGERENTRIES.LIST>
+
+            <ALLLEDGERENTRIES.LIST>
+              <LEDGERNAME>${escapeXml(payload.customerName)}</LEDGERNAME>
+              <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>
+              <ISPARTYLEDGER>Yes</ISPARTYLEDGER>
+              <AMOUNT>${escapeXml(partyAmount)}</AMOUNT>
+              <BILLALLOCATIONS.LIST>
+                <NAME>${escapeXml(payload.billRefName)}</NAME>
+                <BILLTYPE>Agst Ref</BILLTYPE>
+                <AMOUNT>${escapeXml(partyAmount)}</AMOUNT>
+              </BILLALLOCATIONS.LIST>
+            </ALLLEDGERENTRIES.LIST>
+          </VOUCHER>
+        </TALLYMESSAGE>
+      </REQUESTDATA>
+    </IMPORTDATA>
+  </BODY>
+</ENVELOPE>
+`;
+}
+
+function parseTallyImportSummary(rawBody) {
+  const body = typeof rawBody === "string" ? rawBody : "";
+  const readCount = (tag) => {
+    const match = body.match(new RegExp(`<${tag}>(\\d+)</${tag}>`, "i"));
+    return match ? Number(match[1]) : 0;
+  };
+  return {
+    created: readCount("CREATED"),
+    altered: readCount("ALTERED"),
+    ignored: readCount("IGNORED"),
+    errors: readCount("ERRORS"),
+    lineError: extractTallyLineError(body),
+  };
+}
+
+async function writeUtrReceiptToTally(job) {
+  const payload = resolveUtrWritebackPayload(job);
+  writeSyncLog({
+    ts: new Date().toISOString(),
+    level: "info",
+    event: "utr_job_identity",
+    jobId: payload.jobId,
+    paymentId: payload.paymentId,
+    customerName: payload.customerName,
+    invoiceNo: payload.invoiceNo,
+    invoiceDateYmd: payload.invoiceDateYmd,
+    sourceId: payload.sourceId,
+    amount: payload.amountText,
+    paymentDate: payload.paymentDateYmd,
+    bankLedgerName: payload.bankLedgerName,
+    voucherTypeName: payload.voucherTypeName,
+    companyName: payload.companyName || null,
+    dryRun: UTR_WRITEBACK_DRY_RUN,
+  });
+
+  if (UTR_WRITEBACK_DRY_RUN) {
+    return {
+      dryRun: true,
+      writtenUtr: payload.utrNumber,
+      tallyReceiptRef: `DRYRUN-${payload.paymentId}`,
+      summary: {
+        created: 1,
+        altered: 0,
+        ignored: 0,
+        errors: 0,
+      },
+      payload,
+    };
+  }
+
+  const xml = buildTallyReceiptImportXml(payload);
+  let resp;
+  try {
+    resp = await requestTallyRaw(xml, UTR_TALLY_TIMEOUT_MS);
+  } catch (err) {
+    throw new Error(buildStageError("TALLY_IMPORT_FAIL", err));
+  }
+
+  const summary = parseTallyImportSummary(resp.body);
+  writeSyncLog({
+    ts: new Date().toISOString(),
+    level: summary.lineError || summary.errors > 0 ? "error" : "info",
+    event: "utr_tally_import_response",
+    jobId: payload.jobId,
+    statusCode: resp.statusCode,
+    summary,
+    responsePreview: summarizeResponseBody(resp.body, 1200),
+  });
+
+  if (summary.lineError || summary.errors > 0) {
+    throw new Error(
+      `TALLY_IMPORT_FAIL: ${summary.lineError || "Import reported errors"}`
+    );
+  }
+  if (summary.created <= 0 && summary.altered <= 0) {
+    throw new Error("TALLY_IMPORT_FAIL: No voucher created/altered");
+  }
+
+  return {
+    dryRun: false,
+    writtenUtr: payload.utrNumber,
+    tallyReceiptRef: `${payload.voucherTypeName}/${payload.billRefName}/${payload.paymentDateYmd}`,
+    summary,
+    payload,
+  };
+}
+
+async function processOneUtrWritebackJob() {
+  const job = await claimNextUtrWritebackJob();
+  if (!job) return { status: "idle" };
+
+  const jobId = job.jobId || job.id;
+  if (!jobId) {
+    throw new Error("Received UTR writeback job without jobId");
+  }
+
+  writeSyncLog({
+    ts: new Date().toISOString(),
+    level: "info",
+    event: "utr_job_claimed",
+    jobId,
+    invoiceId: job.invoiceId || null,
+    paymentId: getJobField(job, "paymentId", "transactionId", "giropieTxnId") || null,
+  });
+
+  let result = null;
+  let processingError = null;
+  try {
+    const writeback = await writeUtrReceiptToTally(job);
+    await markUtrJobComplete(jobId, {
+      status: "done",
+      writtenUtr: writeback.writtenUtr,
+      tallyReceiptRef: writeback.tallyReceiptRef,
+      dryRun: Boolean(writeback.dryRun),
+      tallySummary: writeback.summary || null,
+      agentMeta: {
+        version: app.getVersion(),
+        platform: process.platform,
+        processedAt: new Date().toISOString(),
+      },
+    });
+    result = {
+      status: "done",
+      jobId,
+      writtenUtr: writeback.writtenUtr,
+      tallyReceiptRef: writeback.tallyReceiptRef,
+      dryRun: Boolean(writeback.dryRun),
+    };
+  } catch (err) {
+    const msg = err && err.message ? err.message : String(err);
+    processingError = msg.startsWith("MATCH_FAIL:") ||
+      msg.startsWith("TALLY_IMPORT_FAIL:") ||
+      msg.startsWith("COMPLETE_API")
+      ? err
+      : new Error(buildStageError("WRITEBACK", err));
+  } finally {
+    if (!result) {
+      const msg =
+        processingError && processingError.message
+          ? processingError.message
+          : "WRITEBACK: Unknown UTR writeback error";
+      try {
+        await markUtrJobFailed(jobId, msg);
+        result = { status: "failed", jobId, error: msg };
+      } catch (failErr) {
+        writeSyncLog({
+          ts: new Date().toISOString(),
+          level: "error",
+          event: "utr_job_fail_callback_error",
+          jobId,
+          error: failErr && failErr.message ? failErr.message : String(failErr),
+        });
+      }
+    }
+  }
+
+  if (result && result.status === "done") {
+    writeSyncLog({
+      ts: new Date().toISOString(),
+      level: "info",
+      event: "utr_job_completed",
+      jobId,
+      writtenUtr: result.writtenUtr,
+      tallyReceiptRef: result.tallyReceiptRef,
+      dryRun: Boolean(result.dryRun),
+    });
+    return result;
+  }
+
+  writeSyncLog({
+    ts: new Date().toISOString(),
+    level: "error",
+    event: "utr_job_failed",
+    jobId,
+    error: result && result.error ? result.error : "Failed to finalize UTR writeback",
+  });
+  return result || { status: "error", jobId, error: "Failed to finalize UTR writeback" };
+}
+
+async function runUtrWritebackWorkerTick() {
+  if (!utrWorkerRunning || utrWorkerBusy) return;
+  utrWorkerBusy = true;
+  try {
+    await processOneUtrWritebackJob();
+  } catch (err) {
+    writeSyncLog({
+      ts: new Date().toISOString(),
+      level: "error",
+      event: "utr_worker_tick_error",
+      error: err && err.message ? err.message : String(err),
+    });
+  } finally {
+    utrWorkerBusy = false;
+    if (utrWorkerRunning) {
+      utrWorkerTimer = setTimeout(runUtrWritebackWorkerTick, UTR_WRITEBACK_POLL_MS);
+    }
+  }
+}
+
+function startUtrWritebackWorker(reason = "manual") {
+  if (!ENABLE_UTR_WRITEBACK_WORKER || utrWorkerRunning) return;
+  utrWorkerRunning = true;
+  writeSyncLog({
+    ts: new Date().toISOString(),
+    level: "info",
+    event: "utr_worker_start",
+    reason,
+    pollMs: UTR_WRITEBACK_POLL_MS,
+  });
+  utrWorkerTimer = setTimeout(runUtrWritebackWorkerTick, UTR_WRITEBACK_POLL_MS);
+}
+
+function stopUtrWritebackWorker(reason = "manual") {
+  if (!utrWorkerRunning && !utrWorkerTimer) return;
+  utrWorkerRunning = false;
+  if (utrWorkerTimer) {
+    clearTimeout(utrWorkerTimer);
+    utrWorkerTimer = null;
+  }
+  writeSyncLog({
+    ts: new Date().toISOString(),
+    level: "info",
+    event: "utr_worker_stop",
+    reason,
+  });
+}
+
+function getUtrWorkerStatus() {
+  return {
+    enabled: ENABLE_UTR_WRITEBACK_WORKER,
+    running: utrWorkerRunning,
+    busy: utrWorkerBusy,
+    pollMs: UTR_WRITEBACK_POLL_MS,
+    claimPath: UTR_JOB_CLAIM_PATH,
+    completePath: UTR_JOB_COMPLETE_PATH,
+    failPath: UTR_JOB_FAIL_PATH,
+    backendBaseUrl: BACKEND_BASE_URL,
+    dryRun: UTR_WRITEBACK_DRY_RUN,
+    hasIdToken: Boolean(currentIdToken),
+    userUid: currentUserUid || null,
+    companyId: resolveCompanyId() || null,
+  };
+}
+
 function extractInvoicesFromTallyXML(xml, options = {}) {
   const parser = new XMLParser({
     ignoreAttributes: false,
@@ -2814,9 +3377,23 @@ ipcMain.handle("run-pdf-worker-once", async () => {
   }
 });
 
+ipcMain.handle("get-utr-worker-status", async () => {
+  return { status: "ok", worker: getUtrWorkerStatus() };
+});
+
+ipcMain.handle("run-utr-worker-once", async () => {
+  try {
+    const result = await processOneUtrWritebackJob();
+    return { status: "ok", result };
+  } catch (err) {
+    return { status: "error", message: err.message };
+  }
+});
+
 ipcMain.handle("logout", async () => {
   try {
     stopPdfWorker("logout");
+    stopUtrWritebackWorker("logout");
     try {
       await firebase.auth().signOut();
     } catch (e) {}
