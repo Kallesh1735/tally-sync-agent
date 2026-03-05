@@ -15,7 +15,6 @@ const DEFAULT_BACKEND_BASE_URL = "https://giro-pie-frontend.vercel.app";
 function parseBooleanEnv(value, defaultValue = false) {
   if (value === undefined || value === null || value === "") {
     return defaultValue;
-    return defaultValue;
   }
   const normalized = String(value).trim().toLowerCase();
   return ["1", "true", "yes", "on"].includes(normalized);
@@ -41,6 +40,7 @@ const path = require("path");
 const fs = require("fs");
 const http = require("http");
 const https = require("https");
+const os = require("os");
 const querystring = require("querystring");
  
 // -----------------------------
@@ -127,6 +127,16 @@ const UTR_JOB_FAIL_PATH =
 const UTR_TALLY_TIMEOUT_MS = Number(
   process.env.UTR_TALLY_TIMEOUT_MS || TALLY_REQUEST_TIMEOUT_MS
 );
+const UTR_JOB_MAX_PROCESS_MS = Number(
+  process.env.UTR_JOB_MAX_PROCESS_MS || Math.max(UTR_TALLY_TIMEOUT_MS + 15000, 60000)
+);
+const UTR_QUEUE_DRAIN_MAX_PER_TICK = Number(
+  process.env.UTR_QUEUE_DRAIN_MAX_PER_TICK || 20
+);
+const UTR_BACKEND_RETRY_COUNT = Number(process.env.UTR_BACKEND_RETRY_COUNT || 2);
+const UTR_BACKEND_RETRY_BASE_DELAY_MS = Number(
+  process.env.UTR_BACKEND_RETRY_BASE_DELAY_MS || 400
+);
 const UTR_WRITEBACK_DRY_RUN = parseBooleanEnv(
   process.env.UTR_WRITEBACK_DRY_RUN,
   false
@@ -174,6 +184,9 @@ console.log(
   `UTR_WRITEBACK_POLL_MS=${UTR_WRITEBACK_POLL_MS}`,
   `UTR_JOB_CLAIM_PATH=${UTR_JOB_CLAIM_PATH}`,
   `UTR_TALLY_TIMEOUT_MS=${UTR_TALLY_TIMEOUT_MS}`,
+  `UTR_JOB_MAX_PROCESS_MS=${UTR_JOB_MAX_PROCESS_MS}`,
+  `UTR_QUEUE_DRAIN_MAX_PER_TICK=${UTR_QUEUE_DRAIN_MAX_PER_TICK}`,
+  `UTR_BACKEND_RETRY_COUNT=${UTR_BACKEND_RETRY_COUNT}`,
   `UTR_WRITEBACK_DRY_RUN=${UTR_WRITEBACK_DRY_RUN}`,
   `UTR_RECEIPT_VOUCHER_TYPE=${DEFAULT_RECEIPT_VOUCHER_TYPE}`
 );
@@ -1462,6 +1475,20 @@ function buildTallyDateVariants(rawDate) {
   return [...new Set(variants.filter(Boolean))];
 }
 
+function getAgentMeta(extra = {}) {
+  const deviceId =
+    process.env.GIROPIE_DEVICE_ID ||
+    process.env.DEVICE_ID ||
+    os.hostname() ||
+    "unknown-device";
+  return {
+    version: app.getVersion(),
+    platform: process.platform,
+    deviceId,
+    ...extra,
+  };
+}
+
 function parseMoneyAmount(value) {
   if (value === null || value === undefined || value === "") return 0;
   if (typeof value === "number") return Number.isFinite(value) ? value : 0;
@@ -2225,19 +2252,23 @@ async function claimNextUtrWritebackJob() {
     companyId: companyId || null,
     path: UTR_JOB_CLAIM_PATH,
   });
-  const res = await requestBackendJson(buildBackendUrl(UTR_JOB_CLAIM_PATH), {
-    method: "POST",
-    payload: {
-      companyId: companyId || null,
-      jobType: "UTR_WRITEBACK",
-      agent: {
-        name: "giropie-tally-agent",
-        version: app.getVersion(),
-        platform: process.platform,
+  const res = await requestBackendJsonWithRetry(
+    buildBackendUrl(UTR_JOB_CLAIM_PATH),
+    {
+      method: "POST",
+      payload: {
+        companyId: companyId || null,
+        jobType: "UTR_WRITEBACK",
+        agent: {
+          name: "giropie-tally-agent",
+          version: app.getVersion(),
+          platform: process.platform,
+        },
       },
+      timeoutMs: PDF_JOB_REQUEST_TIMEOUT_MS,
     },
-    timeoutMs: PDF_JOB_REQUEST_TIMEOUT_MS,
-  });
+    { stage: "claim", path: UTR_JOB_CLAIM_PATH }
+  );
   writeSyncLog({
     ts: new Date().toISOString(),
     level: "info",
@@ -2272,11 +2303,15 @@ async function markUtrJobComplete(jobId, payload) {
       dryRun: Boolean(payload && payload.dryRun),
     },
   });
-  const res = await requestBackendJson(buildBackendUrl(pathWithId), {
-    method: "POST",
-    payload,
-    timeoutMs: PDF_JOB_REQUEST_TIMEOUT_MS,
-  });
+  const res = await requestBackendJsonWithRetry(
+    buildBackendUrl(pathWithId),
+    {
+      method: "POST",
+      payload,
+      timeoutMs: PDF_JOB_REQUEST_TIMEOUT_MS,
+    },
+    { stage: "complete", path: pathWithId }
+  );
   writeSyncLog({
     ts: new Date().toISOString(),
     level: "info",
@@ -2288,9 +2323,15 @@ async function markUtrJobComplete(jobId, payload) {
   return res;
 }
 
-async function markUtrJobFailed(jobId, errorMessage) {
+async function markUtrJobFailed(jobId, errorMessage, extra = {}) {
   const pathWithId = resolvePathWithJobId(UTR_JOB_FAIL_PATH, jobId);
-  const payload = { error: String(errorMessage || "Unknown UTR writeback error") };
+  const payload = {
+    error: String(errorMessage || "Unknown UTR writeback error"),
+    agentMeta: getAgentMeta({
+      processedAt: new Date().toISOString(),
+      ...(extra.agentMeta || {}),
+    }),
+  };
   writeSyncLog({
     ts: new Date().toISOString(),
     level: "error",
@@ -2299,11 +2340,15 @@ async function markUtrJobFailed(jobId, errorMessage) {
     path: pathWithId,
     payload,
   });
-  const res = await requestBackendJson(buildBackendUrl(pathWithId), {
-    method: "POST",
-    payload,
-    timeoutMs: PDF_JOB_REQUEST_TIMEOUT_MS,
-  });
+  const res = await requestBackendJsonWithRetry(
+    buildBackendUrl(pathWithId),
+    {
+      method: "POST",
+      payload,
+      timeoutMs: PDF_JOB_REQUEST_TIMEOUT_MS,
+    },
+    { stage: "fail", path: pathWithId }
+  );
   writeSyncLog({
     ts: new Date().toISOString(),
     level: "info",
@@ -2577,19 +2622,37 @@ async function processOneUtrWritebackJob() {
   let result = null;
   let processingError = null;
   try {
-    const writeback = await writeUtrReceiptToTally(job);
-    await markUtrJobComplete(jobId, {
-      status: "done",
-      writtenUtr: writeback.writtenUtr,
-      tallyReceiptRef: writeback.tallyReceiptRef,
-      dryRun: Boolean(writeback.dryRun),
-      tallySummary: writeback.summary || null,
-      agentMeta: {
-        version: app.getVersion(),
-        platform: process.platform,
-        processedAt: new Date().toISOString(),
-      },
+    let watchdog = null;
+    const watchdogPromise = new Promise((_, reject) => {
+      watchdog = setTimeout(() => {
+        reject(
+          new Error(
+            `TALLY_IMPORT_TIMEOUT: UTR writeback exceeded ${UTR_JOB_MAX_PROCESS_MS}ms`
+          )
+        );
+      }, UTR_JOB_MAX_PROCESS_MS);
     });
+
+    const writeback = await Promise.race([
+      writeUtrReceiptToTally(job),
+      watchdogPromise,
+    ]).finally(() => {
+      if (watchdog) clearTimeout(watchdog);
+    });
+    try {
+      await markUtrJobComplete(jobId, {
+        status: "done",
+        writtenUtr: writeback.writtenUtr,
+        tallyReceiptRef: writeback.tallyReceiptRef,
+        dryRun: Boolean(writeback.dryRun),
+        tallySummary: writeback.summary || null,
+        agentMeta: getAgentMeta({
+          processedAt: new Date().toISOString(),
+        }),
+      });
+    } catch (err) {
+      throw new Error(buildStageError("COMPLETE_API", err));
+    }
     result = {
       status: "done",
       jobId,
@@ -2611,7 +2674,9 @@ async function processOneUtrWritebackJob() {
           ? processingError.message
           : "WRITEBACK: Unknown UTR writeback error";
       try {
-        await markUtrJobFailed(jobId, msg);
+        await markUtrJobFailed(jobId, msg, {
+          agentMeta: { stage: "process_utr_writeback_job" },
+        });
         result = { status: "failed", jobId, error: msg };
       } catch (failErr) {
         writeSyncLog({
@@ -2652,7 +2717,21 @@ async function runUtrWritebackWorkerTick() {
   if (!utrWorkerRunning || utrWorkerBusy) return;
   utrWorkerBusy = true;
   try {
-    await processOneUtrWritebackJob();
+    let processed = 0;
+    for (let i = 0; i < UTR_QUEUE_DRAIN_MAX_PER_TICK; i += 1) {
+      const result = await processOneUtrWritebackJob();
+      if (!result || result.status === "idle") {
+        break;
+      }
+      processed += 1;
+    }
+    writeSyncLog({
+      ts: new Date().toISOString(),
+      level: "info",
+      event: "utr_worker_tick_complete",
+      processedJobs: processed,
+      maxPerTick: UTR_QUEUE_DRAIN_MAX_PER_TICK,
+    });
   } catch (err) {
     writeSyncLog({
       ts: new Date().toISOString(),
@@ -2668,8 +2747,84 @@ async function runUtrWritebackWorkerTick() {
   }
 }
 
+function isRetryableBackendError(err) {
+  if (!err) return false;
+  const statusCode = Number(err.statusCode || 0);
+  if (statusCode === 429 || statusCode >= 500) return true;
+
+  const msg = String(err.message || "").toLowerCase();
+  if (!msg) return false;
+  const transientHints = [
+    "timed out",
+    "timeout",
+    "econnreset",
+    "socket hang up",
+    "econnrefused",
+    "eai_again",
+    "enotfound",
+    "network",
+  ];
+  return transientHints.some((hint) => msg.includes(hint));
+}
+
+async function requestBackendJsonWithRetry(url, options = {}, retryMeta = {}) {
+  const maxAttempts = Math.max(1, UTR_BACKEND_RETRY_COUNT + 1);
+  let lastErr = null;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      return await requestBackendJson(url, options);
+    } catch (err) {
+      lastErr = err;
+      const retryable = isRetryableBackendError(err);
+      if (!retryable || attempt >= maxAttempts) {
+        throw err;
+      }
+      const jitter = Math.floor(Math.random() * 250);
+      const delayMs = UTR_BACKEND_RETRY_BASE_DELAY_MS * attempt + jitter;
+      writeSyncLog({
+        ts: new Date().toISOString(),
+        level: "warn",
+        event: "utr_backend_retry",
+        stage: retryMeta.stage || "backend_request",
+        path: retryMeta.path || null,
+        attempt,
+        maxAttempts,
+        delayMs,
+        statusCode: err && err.statusCode ? err.statusCode : null,
+        error: err && err.message ? err.message : String(err),
+      });
+      await delay(delayMs);
+    }
+  }
+
+  throw lastErr || new Error("Unknown backend retry failure");
+}
+
+function validateUtrWorkerConfig() {
+  const issues = [];
+  if (!BACKEND_BASE_URL) issues.push("BACKEND_BASE_URL missing");
+  if (!UTR_JOB_CLAIM_PATH) issues.push("UTR_JOB_CLAIM_PATH missing");
+  if (!UTR_JOB_COMPLETE_PATH) issues.push("UTR_JOB_COMPLETE_PATH missing");
+  if (!UTR_JOB_FAIL_PATH) issues.push("UTR_JOB_FAIL_PATH missing");
+  if (!DEFAULT_RECEIPT_VOUCHER_TYPE) issues.push("UTR_RECEIPT_VOUCHER_TYPE missing");
+  if (!DEFAULT_RECEIPT_BANK_LEDGER) issues.push("UTR_RECEIPT_BANK_LEDGER missing");
+  return issues;
+}
+
 function startUtrWritebackWorker(reason = "manual") {
   if (!ENABLE_UTR_WRITEBACK_WORKER || utrWorkerRunning) return;
+  const configIssues = validateUtrWorkerConfig();
+  if (configIssues.length > 0) {
+    writeSyncLog({
+      ts: new Date().toISOString(),
+      level: "error",
+      event: "utr_worker_config_invalid",
+      reason,
+      issues: configIssues,
+    });
+    return;
+  }
   utrWorkerRunning = true;
   writeSyncLog({
     ts: new Date().toISOString(),
@@ -2697,16 +2852,22 @@ function stopUtrWritebackWorker(reason = "manual") {
 }
 
 function getUtrWorkerStatus() {
+  const configIssues = validateUtrWorkerConfig();
   return {
     enabled: ENABLE_UTR_WRITEBACK_WORKER,
     running: utrWorkerRunning,
     busy: utrWorkerBusy,
     pollMs: UTR_WRITEBACK_POLL_MS,
+    maxProcessMs: UTR_JOB_MAX_PROCESS_MS,
+    maxDrainPerTick: UTR_QUEUE_DRAIN_MAX_PER_TICK,
+    backendRetryCount: UTR_BACKEND_RETRY_COUNT,
     claimPath: UTR_JOB_CLAIM_PATH,
     completePath: UTR_JOB_COMPLETE_PATH,
     failPath: UTR_JOB_FAIL_PATH,
     backendBaseUrl: BACKEND_BASE_URL,
     dryRun: UTR_WRITEBACK_DRY_RUN,
+    configValid: configIssues.length === 0,
+    configIssues,
     hasIdToken: Boolean(currentIdToken),
     userUid: currentUserUid || null,
     companyId: resolveCompanyId() || null,
