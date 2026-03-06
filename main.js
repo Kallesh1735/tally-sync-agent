@@ -2244,7 +2244,7 @@ function getPdfWorkerStatus() {
 }
 
 async function claimNextUtrWritebackJob() {
-  const companyId = resolveCompanyId();
+  const companyId = resolveWorkerCompanyId();
   writeSyncLog({
     ts: new Date().toISOString(),
     level: "info",
@@ -2265,6 +2265,7 @@ async function claimNextUtrWritebackJob() {
           platform: process.platform,
         },
       },
+      headers: companyId ? { "x-company-id": companyId } : {},
       timeoutMs: PDF_JOB_REQUEST_TIMEOUT_MS,
     },
     { stage: "claim", path: UTR_JOB_CLAIM_PATH }
@@ -2283,6 +2284,10 @@ async function claimNextUtrWritebackJob() {
   if (body.job && typeof body.job === "object") return body.job;
   if (body.id || body.jobId) return body;
   return null;
+}
+
+function resolveWorkerCompanyId() {
+  return resolveCompanyId() || currentUserUid || null;
 }
 
 async function markUtrJobComplete(jobId, payload) {
@@ -2870,7 +2875,7 @@ function getUtrWorkerStatus() {
     configIssues,
     hasIdToken: Boolean(currentIdToken),
     userUid: currentUserUid || null,
-    companyId: resolveCompanyId() || null,
+    companyId: resolveWorkerCompanyId() || null,
   };
 }
 
