@@ -145,6 +145,8 @@ const DEFAULT_RECEIPT_VOUCHER_TYPE =
   process.env.UTR_RECEIPT_VOUCHER_TYPE || "Receipt";
 const DEFAULT_RECEIPT_BANK_LEDGER =
   process.env.UTR_RECEIPT_BANK_LEDGER || "HDFC Bank";
+const DEFAULT_BANK_TRANSACTION_TYPE =
+  process.env.UTR_BANK_TRANSACTION_TYPE || "e-Fund Transfer";
 
 let pdfWorkerTimer = null;
 let pdfWorkerRunning = false;
@@ -188,7 +190,8 @@ console.log(
   `UTR_QUEUE_DRAIN_MAX_PER_TICK=${UTR_QUEUE_DRAIN_MAX_PER_TICK}`,
   `UTR_BACKEND_RETRY_COUNT=${UTR_BACKEND_RETRY_COUNT}`,
   `UTR_WRITEBACK_DRY_RUN=${UTR_WRITEBACK_DRY_RUN}`,
-  `UTR_RECEIPT_VOUCHER_TYPE=${DEFAULT_RECEIPT_VOUCHER_TYPE}`
+  `UTR_RECEIPT_VOUCHER_TYPE=${DEFAULT_RECEIPT_VOUCHER_TYPE}`,
+  `UTR_BANK_TRANSACTION_TYPE=${DEFAULT_BANK_TRANSACTION_TYPE}`
 );
 
 function delay(ms) {
@@ -2430,6 +2433,15 @@ function resolveUtrWritebackPayload(job) {
   const voucherTypeName =
     normalizeDisplayValue(getJobField(job, "receiptVoucherType", "voucherTypeName")) ||
     DEFAULT_RECEIPT_VOUCHER_TYPE;
+  const bankTransactionType =
+    normalizeDisplayValue(
+      getJobField(
+        job,
+        "bankTransactionType",
+        "bankAllocTransactionType",
+        "fundTransferType"
+      )
+    ) || DEFAULT_BANK_TRANSACTION_TYPE;
   const companyNameRaw = normalizeCompanyName(
     getJobField(job, "companyName", "tallyCompanyName")
   );
@@ -2452,6 +2464,7 @@ function resolveUtrWritebackPayload(job) {
     billRefName,
     utrNumber,
     bankLedgerName,
+    bankTransactionType,
     voucherTypeName,
     companyName,
     narration,
@@ -2497,6 +2510,16 @@ ${staticVars}
               <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
               <ISPARTYLEDGER>No</ISPARTYLEDGER>
               <AMOUNT>${escapeXml(bankAmount)}</AMOUNT>
+              <BANKALLOCATIONS.LIST>
+                <DATE>${escapeXml(payload.paymentDateYmd)}</DATE>
+                <INSTRUMENTDATE>${escapeXml(payload.paymentDateYmd)}</INSTRUMENTDATE>
+                <INSTRUMENTNUMBER>${escapeXml(payload.utrNumber)}</INSTRUMENTNUMBER>
+                <TRANSACTIONTYPE>${escapeXml(payload.bankTransactionType)}</TRANSACTIONTYPE>
+                <UNIQUEREFERENCENUMBER>${escapeXml(payload.utrNumber)}</UNIQUEREFERENCENUMBER>
+                <PAYMENTFAVOURING>${escapeXml(payload.customerName)}</PAYMENTFAVOURING>
+                <BANKPARTYNAME>${escapeXml(payload.customerName)}</BANKPARTYNAME>
+                <AMOUNT>${escapeXml(bankAmount)}</AMOUNT>
+              </BANKALLOCATIONS.LIST>
             </ALLLEDGERENTRIES.LIST>
 
             <ALLLEDGERENTRIES.LIST>
@@ -2549,6 +2572,7 @@ async function writeUtrReceiptToTally(job) {
     amount: payload.amountText,
     paymentDate: payload.paymentDateYmd,
     bankLedgerName: payload.bankLedgerName,
+    bankTransactionType: payload.bankTransactionType,
     voucherTypeName: payload.voucherTypeName,
     companyName: payload.companyName || null,
     dryRun: UTR_WRITEBACK_DRY_RUN,
@@ -2814,6 +2838,7 @@ function validateUtrWorkerConfig() {
   if (!UTR_JOB_FAIL_PATH) issues.push("UTR_JOB_FAIL_PATH missing");
   if (!DEFAULT_RECEIPT_VOUCHER_TYPE) issues.push("UTR_RECEIPT_VOUCHER_TYPE missing");
   if (!DEFAULT_RECEIPT_BANK_LEDGER) issues.push("UTR_RECEIPT_BANK_LEDGER missing");
+  if (!DEFAULT_BANK_TRANSACTION_TYPE) issues.push("UTR_BANK_TRANSACTION_TYPE missing");
   return issues;
 }
 
