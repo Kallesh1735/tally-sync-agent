@@ -985,6 +985,7 @@ ${companyXml}
     (async () => {
       let lastResponse = null;
       let lastReport = null;
+      let lastError = null;
 
       const requestCompanies = envCompany
         ? [envCompany]
@@ -1019,6 +1020,7 @@ ${companyXml}
               });
             }
           } catch (err) {
+            lastError = err;
             console.error(
               "Tally request failed for report",
               r,
@@ -1036,7 +1038,9 @@ ${companyXml}
         }
       }
 
-      // If none returned vouchers, send the last response (or an empty string)
+      // If no report produced vouchers:
+      // - return the last successful XML response (even if non-voucher summary), or
+      // - fail fast with last known error (avoid another redundant timeout attempt).
       try {
         if (lastResponse) {
           return resolve({
@@ -1055,26 +1059,13 @@ ${companyXml}
             },
           });
         }
-
-        const last = buildXml(tryReports[0], requestCompanies[0] || null);
-        const fallback = await sendXmlWithRetry(last, tryReports[0]);
-        return resolve({
-          xml: fallback.data || "",
-          meta: {
-            ...metaBase,
-            requestedCompany: requestCompanies[0] || null,
-            detectedCompany:
-              detectCompanyNameFromTallyXml(fallback.data || "") ||
-              requestCompanies[0] ||
-              null,
-            selectedReport: tryReports[0],
-            responseStatus: fallback.statusCode,
-            responseBytes: Buffer.byteLength(fallback.data || ""),
-            responseHasVoucher: fallback.data
-              ? fallback.data.includes("<VOUCHER")
-              : false,
-          },
-        });
+        const lastErrMsg =
+          lastError && lastError.message
+            ? lastError.message
+            : "No Tally report returned data";
+        return reject(
+          new Error(`All Tally report attempts failed. Last error: ${lastErrMsg}`)
+        );
       } catch (e) {
         return reject(e);
       }
