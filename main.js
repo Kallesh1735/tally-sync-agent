@@ -1058,15 +1058,6 @@ ${companyXml}
     };
 
     (async () => {
-      const portOpen = await checkTcpPortOpen("127.0.0.1", 9000, 1200);
-      if (!portOpen) {
-        return reject(
-          new Error(
-            "Cannot connect to Tally on 127.0.0.1:9000. Ensure Tally is open and XML/HTTP is enabled."
-          )
-        );
-      }
-
       let lastResponse = null;
       let lastReport = null;
       let lastError = null;
