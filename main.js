@@ -88,6 +88,12 @@ const TALLY_VOUCHERS_TIMEOUT_MS = Number(
 const TALLY_VOUCHERS_MAX_ATTEMPTS = Number(
   process.env.TALLY_VOUCHERS_MAX_ATTEMPTS || 1
 );
+const TALLY_DAYBOOK_TIMEOUT_MS = Number(
+  process.env.TALLY_DAYBOOK_TIMEOUT_MS || 20000
+);
+const TALLY_DAYBOOK_MAX_ATTEMPTS = Number(
+  process.env.TALLY_DAYBOOK_MAX_ATTEMPTS || 1
+);
 const TALLY_REPORT_ORDER = (process.env.TALLY_REPORT_ORDER ||
   "Day Book,Vouchers,Voucher Register (Sales),Voucher Register")
   .split(",")
@@ -169,12 +175,15 @@ let pdfWorkerBusy = false;
 let utrWorkerTimer = null;
 let utrWorkerRunning = false;
 let utrWorkerBusy = false;
+let liveSyncInProgress = false;
 
 console.log(
   "Timeouts:",
   `TALLY_TIMEOUT_MS=${TALLY_REQUEST_TIMEOUT_MS}`,
   `TALLY_VOUCHERS_TIMEOUT_MS=${TALLY_VOUCHERS_TIMEOUT_MS}`,
   `TALLY_VOUCHERS_MAX_ATTEMPTS=${TALLY_VOUCHERS_MAX_ATTEMPTS}`,
+  `TALLY_DAYBOOK_TIMEOUT_MS=${TALLY_DAYBOOK_TIMEOUT_MS}`,
+  `TALLY_DAYBOOK_MAX_ATTEMPTS=${TALLY_DAYBOOK_MAX_ATTEMPTS}`,
   `BACKEND_TIMEOUT_MS=${BACKEND_REQUEST_TIMEOUT_MS}`,
   `TALLY_RETRY_COUNT=${TALLY_REQUEST_RETRIES}`,
   `TALLY_RETRY_DELAY_MS=${TALLY_RETRY_DELAY_MS}`
@@ -975,11 +984,16 @@ ${companyXml}
     const sendXmlWithRetry = async (xml, reportName) => {
       let lastErr = null;
       const isVouchersReport = /^vouchers$/i.test(String(reportName || "").trim());
+      const isDayBookReport = /^day book$/i.test(String(reportName || "").trim());
       const totalAttempts = isVouchersReport
         ? Math.max(1, TALLY_VOUCHERS_MAX_ATTEMPTS)
+        : isDayBookReport
+        ? Math.max(1, TALLY_DAYBOOK_MAX_ATTEMPTS)
         : Math.max(0, TALLY_REQUEST_RETRIES) + 1;
       const timeoutMs = isVouchersReport
         ? Math.min(TALLY_REQUEST_TIMEOUT_MS, Math.max(1, TALLY_VOUCHERS_TIMEOUT_MS))
+        : isDayBookReport
+        ? Math.min(TALLY_REQUEST_TIMEOUT_MS, Math.max(1, TALLY_DAYBOOK_TIMEOUT_MS))
         : TALLY_REQUEST_TIMEOUT_MS;
       for (let attempt = 1; attempt <= totalAttempts; attempt += 1) {
         try {
@@ -1094,6 +1108,10 @@ ${companyXml}
 // -----------------------------
 ipcMain.handle("sync-from-tally", async () => {
   console.log("IPC received: sync-from-tally");
+  if (liveSyncInProgress) {
+    return { status: "warning", message: "Sync already in progress. Please wait." };
+  }
+  liveSyncInProgress = true;
 
   const syncId = createSyncId();
   writeSyncLog({
@@ -1163,6 +1181,8 @@ ipcMain.handle("sync-from-tally", async () => {
       error: err.message,
     });
     return { status: "error", message: err.message };
+  } finally {
+    liveSyncInProgress = false;
   }
 });
 
@@ -3519,6 +3539,10 @@ ipcMain.handle('start-sync', async (event, data) => {
   if (!selectedSyncMethod) return { status: 'error', message: 'No sync method selected' };
 
   if (selectedSyncMethod === SYNC_METHODS.LIVE) {
+    if (liveSyncInProgress) {
+      return { status: 'warning', message: 'Sync already in progress. Please wait.' };
+    }
+    liveSyncInProgress = true;
     const isFullSync = Boolean(data && data.forceFullSync);
     const syncId = createSyncId();
     writeSyncLog({
@@ -3601,6 +3625,8 @@ ipcMain.handle('start-sync', async (event, data) => {
         msg = 'Tally did not respond in time. Please try again.';
       }
       return { status: 'error', message: msg };
+    } finally {
+      liveSyncInProgress = false;
     }
   }
 
