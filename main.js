@@ -40,6 +40,7 @@ const path = require("path");
 const fs = require("fs");
 const http = require("http");
 const https = require("https");
+const net = require("net");
 const os = require("os");
 const querystring = require("querystring");
  
@@ -89,10 +90,16 @@ const TALLY_VOUCHERS_MAX_ATTEMPTS = Number(
   process.env.TALLY_VOUCHERS_MAX_ATTEMPTS || 1
 );
 const TALLY_DAYBOOK_TIMEOUT_MS = Number(
-  process.env.TALLY_DAYBOOK_TIMEOUT_MS || 20000
+  process.env.TALLY_DAYBOOK_TIMEOUT_MS || 45000
 );
 const TALLY_DAYBOOK_MAX_ATTEMPTS = Number(
   process.env.TALLY_DAYBOOK_MAX_ATTEMPTS || 1
+);
+const TALLY_VREG_TIMEOUT_MS = Number(
+  process.env.TALLY_VREG_TIMEOUT_MS || 45000
+);
+const TALLY_VREG_MAX_ATTEMPTS = Number(
+  process.env.TALLY_VREG_MAX_ATTEMPTS || 1
 );
 const TALLY_REPORT_ORDER = (process.env.TALLY_REPORT_ORDER ||
   "Day Book,Vouchers,Voucher Register (Sales),Voucher Register")
@@ -184,6 +191,8 @@ console.log(
   `TALLY_VOUCHERS_MAX_ATTEMPTS=${TALLY_VOUCHERS_MAX_ATTEMPTS}`,
   `TALLY_DAYBOOK_TIMEOUT_MS=${TALLY_DAYBOOK_TIMEOUT_MS}`,
   `TALLY_DAYBOOK_MAX_ATTEMPTS=${TALLY_DAYBOOK_MAX_ATTEMPTS}`,
+  `TALLY_VREG_TIMEOUT_MS=${TALLY_VREG_TIMEOUT_MS}`,
+  `TALLY_VREG_MAX_ATTEMPTS=${TALLY_VREG_MAX_ATTEMPTS}`,
   `BACKEND_TIMEOUT_MS=${BACKEND_REQUEST_TIMEOUT_MS}`,
   `TALLY_RETRY_COUNT=${TALLY_REQUEST_RETRIES}`,
   `TALLY_RETRY_DELAY_MS=${TALLY_RETRY_DELAY_MS}`
@@ -664,6 +673,36 @@ function createSyncId() {
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
+function checkTcpPortOpen(host, port, timeoutMs = 1200) {
+  return new Promise((resolve) => {
+    const socket = new net.Socket();
+    let settled = false;
+
+    const finish = (ok) => {
+      if (settled) return;
+      settled = true;
+      try {
+        socket.destroy();
+      } catch (_) {
+        // ignore
+      }
+      resolve(Boolean(ok));
+    };
+
+    socket.setTimeout(timeoutMs);
+    socket.once("connect", () => finish(true));
+    socket.once("timeout", () => finish(false));
+    socket.once("error", () => finish(false));
+    socket.once("close", () => finish(false));
+
+    try {
+      socket.connect(port, host);
+    } catch (_) {
+      finish(false);
+    }
+  });
+}
+
 function computeInvoiceDiagnostics(invoices) {
   const diag = {
     invoiceCount: invoices.length,
@@ -983,17 +1022,23 @@ ${companyXml}
 
     const sendXmlWithRetry = async (xml, reportName) => {
       let lastErr = null;
-      const isVouchersReport = /^vouchers$/i.test(String(reportName || "").trim());
-      const isDayBookReport = /^day book$/i.test(String(reportName || "").trim());
+      const report = String(reportName || "").trim();
+      const isVouchersReport = /^vouchers$/i.test(report);
+      const isDayBookReport = /^day book$/i.test(report);
+      const isVoucherRegisterReport = /^voucher register(\s*\(sales\))?$/i.test(report);
       const totalAttempts = isVouchersReport
         ? Math.max(1, TALLY_VOUCHERS_MAX_ATTEMPTS)
         : isDayBookReport
         ? Math.max(1, TALLY_DAYBOOK_MAX_ATTEMPTS)
+        : isVoucherRegisterReport
+        ? Math.max(1, TALLY_VREG_MAX_ATTEMPTS)
         : Math.max(0, TALLY_REQUEST_RETRIES) + 1;
       const timeoutMs = isVouchersReport
         ? Math.min(TALLY_REQUEST_TIMEOUT_MS, Math.max(1, TALLY_VOUCHERS_TIMEOUT_MS))
         : isDayBookReport
         ? Math.min(TALLY_REQUEST_TIMEOUT_MS, Math.max(1, TALLY_DAYBOOK_TIMEOUT_MS))
+        : isVoucherRegisterReport
+        ? Math.min(TALLY_REQUEST_TIMEOUT_MS, Math.max(1, TALLY_VREG_TIMEOUT_MS))
         : TALLY_REQUEST_TIMEOUT_MS;
       for (let attempt = 1; attempt <= totalAttempts; attempt += 1) {
         try {
@@ -1013,6 +1058,15 @@ ${companyXml}
     };
 
     (async () => {
+      const portOpen = await checkTcpPortOpen("127.0.0.1", 9000, 1200);
+      if (!portOpen) {
+        return reject(
+          new Error(
+            "Cannot connect to Tally on 127.0.0.1:9000. Ensure Tally is open and XML/HTTP is enabled."
+          )
+        );
+      }
+
       let lastResponse = null;
       let lastReport = null;
       let lastError = null;
