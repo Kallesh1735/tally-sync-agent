@@ -80,6 +80,14 @@ const TALLY_REQUEST_TIMEOUT_MS = Number(process.env.TALLY_TIMEOUT_MS || 45000);
 const BACKEND_REQUEST_TIMEOUT_MS = Number(process.env.BACKEND_TIMEOUT_MS || 30000);
 const TALLY_REQUEST_RETRIES = Number(process.env.TALLY_RETRY_COUNT || 0);
 const TALLY_RETRY_DELAY_MS = Number(process.env.TALLY_RETRY_DELAY_MS || 1500);
+// Optional per-report guardrails for heavy "Vouchers" report.
+// This avoids long sync stalls when Vouchers export hangs.
+const TALLY_VOUCHERS_TIMEOUT_MS = Number(
+  process.env.TALLY_VOUCHERS_TIMEOUT_MS || 20000
+);
+const TALLY_VOUCHERS_MAX_ATTEMPTS = Number(
+  process.env.TALLY_VOUCHERS_MAX_ATTEMPTS || 1
+);
 const TALLY_REPORT_ORDER = (process.env.TALLY_REPORT_ORDER ||
   "Day Book,Vouchers,Voucher Register (Sales),Voucher Register")
   .split(",")
@@ -165,6 +173,8 @@ let utrWorkerBusy = false;
 console.log(
   "Timeouts:",
   `TALLY_TIMEOUT_MS=${TALLY_REQUEST_TIMEOUT_MS}`,
+  `TALLY_VOUCHERS_TIMEOUT_MS=${TALLY_VOUCHERS_TIMEOUT_MS}`,
+  `TALLY_VOUCHERS_MAX_ATTEMPTS=${TALLY_VOUCHERS_MAX_ATTEMPTS}`,
   `BACKEND_TIMEOUT_MS=${BACKEND_REQUEST_TIMEOUT_MS}`,
   `TALLY_RETRY_COUNT=${TALLY_REQUEST_RETRIES}`,
   `TALLY_RETRY_DELAY_MS=${TALLY_RETRY_DELAY_MS}`
@@ -927,7 +937,7 @@ ${companyXml}
       },
     };
 
-    const sendXml = (xml) =>
+    const sendXml = (xml, timeoutMs = TALLY_REQUEST_TIMEOUT_MS) =>
       new Promise((resOut, rejOut) => {
         const opts = Object.assign({}, optionsBase, {
           headers: Object.assign({}, optionsBase.headers, {
@@ -950,9 +960,9 @@ ${companyXml}
 
         const timeoutHandle = setTimeout(() => {
           req.destroy(
-            new Error(`Tally request timed out after ${TALLY_REQUEST_TIMEOUT_MS}ms`)
+            new Error(`Tally request timed out after ${timeoutMs}ms`)
           );
-        }, TALLY_REQUEST_TIMEOUT_MS);
+        }, timeoutMs);
 
         req.on('error', (err) => {
           clearTimeout(timeoutHandle);
@@ -964,14 +974,20 @@ ${companyXml}
 
     const sendXmlWithRetry = async (xml, reportName) => {
       let lastErr = null;
-      const totalAttempts = Math.max(0, TALLY_REQUEST_RETRIES) + 1;
+      const isVouchersReport = /^vouchers$/i.test(String(reportName || "").trim());
+      const totalAttempts = isVouchersReport
+        ? Math.max(1, TALLY_VOUCHERS_MAX_ATTEMPTS)
+        : Math.max(0, TALLY_REQUEST_RETRIES) + 1;
+      const timeoutMs = isVouchersReport
+        ? Math.min(TALLY_REQUEST_TIMEOUT_MS, Math.max(1, TALLY_VOUCHERS_TIMEOUT_MS))
+        : TALLY_REQUEST_TIMEOUT_MS;
       for (let attempt = 1; attempt <= totalAttempts; attempt += 1) {
         try {
-          return await sendXml(xml);
+          return await sendXml(xml, timeoutMs);
         } catch (err) {
           lastErr = err;
           console.error(
-            `Tally request failed for report ${reportName} (attempt ${attempt}/${totalAttempts}):`,
+            `Tally request failed for report ${reportName} (attempt ${attempt}/${totalAttempts}, timeout=${timeoutMs}ms):`,
             err && err.message
           );
           if (attempt < totalAttempts) {
