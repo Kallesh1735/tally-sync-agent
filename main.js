@@ -116,6 +116,10 @@ const ENABLE_UTR_WRITEBACK_WORKER = parseBooleanEnv(
   process.env.ENABLE_UTR_WRITEBACK_WORKER,
   true
 );
+// UTR writeback worker overview:
+// - Poll backend queue for pending UTR jobs.
+// - Claim exactly one job, write receipt into Tally, then callback complete/fail.
+// - Never leave a claimed job without terminal callback.
 const UTR_WRITEBACK_POLL_MS = Number(process.env.UTR_WRITEBACK_POLL_MS || 5000);
 const UTR_JOB_CLAIM_PATH =
   process.env.UTR_JOB_CLAIM_PATH || "/api/agent/payment-writeback-jobs/claim";
@@ -1267,6 +1271,7 @@ function buildStageError(stagePrefix, err) {
 
 async function requestBackendJson(url, options = {}) {
   const retried401 = Boolean(options.__retried401);
+  // Ensure we always attach a valid Firebase ID token before backend calls.
   await ensureFreshIdToken();
 
   const runRequest = () =>
@@ -1333,6 +1338,7 @@ async function requestBackendJson(url, options = {}) {
     return await runRequest();
   } catch (err) {
     if (err && err.statusCode === 401 && !retried401) {
+      // Token might have expired between requests. Refresh once and retry exactly once.
       writeSyncLog({
         ts: new Date().toISOString(),
         level: "warn",
@@ -2271,6 +2277,9 @@ function getPdfWorkerStatus() {
 }
 
 async function claimNextUtrWritebackJob() {
+  // Claim API contract:
+  // - 200 with a job => process immediately.
+  // - 204 / empty body => queue empty, worker stays idle until next tick.
   const companyId = resolveWorkerCompanyId();
   writeSyncLog({
     ts: new Date().toISOString(),
@@ -2314,6 +2323,8 @@ async function claimNextUtrWritebackJob() {
 }
 
 function resolveWorkerCompanyId() {
+  // Prefer explicit companyId claim. If absent, fallback to authenticated UID,
+  // because backend supports company-by-uid fallback in single-tenant mode.
   const companyId = resolveCompanyId();
   if (companyId) return companyId;
   if (currentUserUid) return currentUserUid;
@@ -2322,6 +2333,8 @@ function resolveWorkerCompanyId() {
 }
 
 async function markUtrJobComplete(jobId, payload) {
+  // Terminal success callback.
+  // Backend records done state and stores writeback metadata for UI + audits.
   const pathWithId = resolvePathWithJobId(UTR_JOB_COMPLETE_PATH, jobId);
   writeSyncLog({
     ts: new Date().toISOString(),
@@ -2360,6 +2373,8 @@ async function markUtrJobComplete(jobId, payload) {
 }
 
 async function markUtrJobFailed(jobId, errorMessage, extra = {}) {
+  // Terminal failure callback.
+  // Always send exact stage-specific error so we can debug production failures quickly.
   const pathWithId = resolvePathWithJobId(UTR_JOB_FAIL_PATH, jobId);
   const payload = {
     error: String(errorMessage || "Unknown UTR writeback error"),
@@ -2397,6 +2412,8 @@ async function markUtrJobFailed(jobId, errorMessage, extra = {}) {
 }
 
 function resolveUtrWritebackPayload(job) {
+  // Normalize and validate job payload before attempting Tally import.
+  // We fail fast here so backend gets a clear MATCH_FAIL reason.
   const jobId = String(getJobField(job, "jobId", "id") || "").trim();
   if (!jobId) throw new Error("MATCH_FAIL: Missing jobId");
 
@@ -2439,6 +2456,8 @@ function resolveUtrWritebackPayload(job) {
   const billRefName = normalizeDisplayValue(
     getJobField(job, "billRefName", "billName") || invoiceNo || identityFromKey.invoiceNo
   );
+  // Bill reference is critical. Tally uses this value in BILLALLOCATIONS (Agst Ref)
+  // to settle the exact pending invoice/bill.
   if (!billRefName) {
     throw new Error("MATCH_FAIL: Missing bill reference (invoiceNo/billRefName)");
   }
@@ -2500,14 +2519,22 @@ function resolveUtrWritebackPayload(job) {
 }
 
 function buildTallyReceiptImportXml(payload) {
+  // Build Receipt voucher XML for Tally import.
+  // This posts a bank entry + party entry and attaches UTR in reference/bank allocation fields.
   const staticVars = buildStaticVariablesXml({
     ...(payload.companyName ? { SVCURRENTCOMPANY: payload.companyName } : {}),
     SVFROMDATE: payload.paymentDateYmd,
     SVTODATE: payload.paymentDateYmd,
   });
 
-  const bankAmount = payload.amountText;
-  const partyAmount = `-${payload.amountText}`;
+  // Match manual-working Tally receipt pattern:
+  // - Party (debtor) line: ISDEEMEDPOSITIVE=No, AMOUNT=+value (Agst Ref settlement)
+  // - Bank line: ISDEEMEDPOSITIVE=Yes, AMOUNT=-value
+  const partyAmount = payload.amountText;
+  const bankAmount = `-${payload.amountText}`;
+  // Entry structure used below:
+  // 1) Bank ledger entry + BANKALLOCATIONS for instrument/UTR fields.
+  // 2) Party ledger entry + BILLALLOCATIONS (Agst Ref) for invoice settlement.
 
   return `
 <ENVELOPE>
@@ -2534,8 +2561,20 @@ ${staticVars}
             <ISINVOICE>No</ISINVOICE>
 
             <ALLLEDGERENTRIES.LIST>
-              <LEDGERNAME>${escapeXml(payload.bankLedgerName)}</LEDGERNAME>
+              <LEDGERNAME>${escapeXml(payload.customerName)}</LEDGERNAME>
               <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
+              <ISPARTYLEDGER>Yes</ISPARTYLEDGER>
+              <AMOUNT>${escapeXml(partyAmount)}</AMOUNT>
+              <BILLALLOCATIONS.LIST>
+                <NAME>${escapeXml(payload.billRefName)}</NAME>
+                <BILLTYPE>Agst Ref</BILLTYPE>
+                <AMOUNT>${escapeXml(partyAmount)}</AMOUNT>
+              </BILLALLOCATIONS.LIST>
+            </ALLLEDGERENTRIES.LIST>
+
+            <ALLLEDGERENTRIES.LIST>
+              <LEDGERNAME>${escapeXml(payload.bankLedgerName)}</LEDGERNAME>
+              <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>
               <ISPARTYLEDGER>No</ISPARTYLEDGER>
               <AMOUNT>${escapeXml(bankAmount)}</AMOUNT>
               <BANKALLOCATIONS.LIST>
@@ -2549,18 +2588,6 @@ ${staticVars}
                 <AMOUNT>${escapeXml(bankAmount)}</AMOUNT>
               </BANKALLOCATIONS.LIST>
             </ALLLEDGERENTRIES.LIST>
-
-            <ALLLEDGERENTRIES.LIST>
-              <LEDGERNAME>${escapeXml(payload.customerName)}</LEDGERNAME>
-              <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>
-              <ISPARTYLEDGER>Yes</ISPARTYLEDGER>
-              <AMOUNT>${escapeXml(partyAmount)}</AMOUNT>
-              <BILLALLOCATIONS.LIST>
-                <NAME>${escapeXml(payload.billRefName)}</NAME>
-                <BILLTYPE>Agst Ref</BILLTYPE>
-                <AMOUNT>${escapeXml(partyAmount)}</AMOUNT>
-              </BILLALLOCATIONS.LIST>
-            </ALLLEDGERENTRIES.LIST>
           </VOUCHER>
         </TALLYMESSAGE>
       </REQUESTDATA>
@@ -2571,6 +2598,8 @@ ${staticVars}
 }
 
 function parseTallyImportSummary(rawBody) {
+  // Tally import returns CREATED/ALTERED/IGNORED/ERRORS counters in XML.
+  // Parse them to decide whether this writeback is accepted.
   const body = typeof rawBody === "string" ? rawBody : "";
   const readCount = (tag) => {
     const match = body.match(new RegExp(`<${tag}>(\\d+)</${tag}>`, "i"));
@@ -2586,6 +2615,7 @@ function parseTallyImportSummary(rawBody) {
 }
 
 async function writeUtrReceiptToTally(job) {
+  // Stage 1: create receipt XML and import into Tally over port 9000.
   const payload = resolveUtrWritebackPayload(job);
   writeSyncLog({
     ts: new Date().toISOString(),
@@ -2607,6 +2637,7 @@ async function writeUtrReceiptToTally(job) {
   });
 
   if (UTR_WRITEBACK_DRY_RUN) {
+    // Dry run: simulate success without writing an actual voucher in Tally.
     return {
       dryRun: true,
       writtenUtr: payload.utrNumber,
@@ -2641,11 +2672,14 @@ async function writeUtrReceiptToTally(job) {
   });
 
   if (summary.lineError || summary.errors > 0) {
+    // Tally accepted request transport-wise but rejected business import.
+    // Propagate exact line error to backend job for actionable debugging.
     throw new Error(
       `TALLY_IMPORT_FAIL: ${summary.lineError || "Import reported errors"}`
     );
   }
   if (summary.created <= 0 && summary.altered <= 0) {
+    // Defensive guard: no explicit error, but nothing posted.
     throw new Error("TALLY_IMPORT_FAIL: No voucher created/altered");
   }
 
@@ -2659,6 +2693,8 @@ async function writeUtrReceiptToTally(job) {
 }
 
 async function processOneUtrWritebackJob() {
+  // Stage 0: claim one pending job.
+  // Contract: each claimed job must end in exactly one terminal callback (complete or fail).
   const job = await claimNextUtrWritebackJob();
   if (!job) return { status: "idle" };
 
@@ -2679,6 +2715,7 @@ async function processOneUtrWritebackJob() {
   let result = null;
   let processingError = null;
   try {
+    // Guardrail timeout so jobs do not remain stuck in processing.
     let watchdog = null;
     const watchdogPromise = new Promise((_, reject) => {
       watchdog = setTimeout(() => {
@@ -2697,6 +2734,7 @@ async function processOneUtrWritebackJob() {
       if (watchdog) clearTimeout(watchdog);
     });
     try {
+      // Stage 2: send success callback to backend with receipt metadata.
       await markUtrJobComplete(jobId, {
         status: "done",
         writtenUtr: writeback.writtenUtr,
@@ -2731,6 +2769,7 @@ async function processOneUtrWritebackJob() {
           ? processingError.message
           : "WRITEBACK: Unknown UTR writeback error";
       try {
+        // Stage 3: always send fail callback with exact stage-specific error.
         await markUtrJobFailed(jobId, msg, {
           agentMeta: { stage: "process_utr_writeback_job" },
         });
@@ -2771,6 +2810,7 @@ async function processOneUtrWritebackJob() {
 }
 
 async function runUtrWritebackWorkerTick() {
+  // Poller loop: drain queued jobs until claim returns empty (204 / no job).
   if (!utrWorkerRunning || utrWorkerBusy) return;
   utrWorkerBusy = true;
   try {
