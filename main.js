@@ -124,6 +124,9 @@ const UTR_JOB_COMPLETE_PATH =
   "/api/agent/payment-writeback-jobs/:jobId/complete";
 const UTR_JOB_FAIL_PATH =
   process.env.UTR_JOB_FAIL_PATH || "/api/agent/payment-writeback-jobs/:jobId/fail";
+const UTR_BACKEND_REQUEST_TIMEOUT_MS = Number(
+  process.env.UTR_BACKEND_TIMEOUT_MS || Math.min(BACKEND_REQUEST_TIMEOUT_MS, 10000)
+);
 const UTR_TALLY_TIMEOUT_MS = Number(
   process.env.UTR_TALLY_TIMEOUT_MS || TALLY_REQUEST_TIMEOUT_MS
 );
@@ -185,6 +188,7 @@ console.log(
   `ENABLE_UTR_WRITEBACK_WORKER=${ENABLE_UTR_WRITEBACK_WORKER}`,
   `UTR_WRITEBACK_POLL_MS=${UTR_WRITEBACK_POLL_MS}`,
   `UTR_JOB_CLAIM_PATH=${UTR_JOB_CLAIM_PATH}`,
+  `UTR_BACKEND_TIMEOUT_MS=${UTR_BACKEND_REQUEST_TIMEOUT_MS}`,
   `UTR_TALLY_TIMEOUT_MS=${UTR_TALLY_TIMEOUT_MS}`,
   `UTR_JOB_MAX_PROCESS_MS=${UTR_JOB_MAX_PROCESS_MS}`,
   `UTR_QUEUE_DRAIN_MAX_PER_TICK=${UTR_QUEUE_DRAIN_MAX_PER_TICK}`,
@@ -434,6 +438,16 @@ function extractCompanyIdFromClaims(claims) {
   );
 }
 
+function extractUidFromClaims(claims) {
+  if (!claims || typeof claims !== "object") return null;
+  return claims.user_id || claims.uid || claims.sub || null;
+}
+
+function extractEmailFromClaims(claims) {
+  if (!claims || typeof claims !== "object") return null;
+  return claims.email || null;
+}
+
 function loadAuthFromDisk() {
   try {
     if (!fs.existsSync(tokenFilePath)) return;
@@ -453,6 +467,8 @@ function loadAuthFromDisk() {
     if (!currentCompanyId && currentIdToken) {
       const claims = decodeJwtPayload(currentIdToken);
       currentCompanyId = extractCompanyIdFromClaims(claims);
+      if (!currentUserUid) currentUserUid = extractUidFromClaims(claims);
+      if (!currentUserEmail) currentUserEmail = extractEmailFromClaims(claims);
     }
 
     if (currentIdToken) {
@@ -560,6 +576,9 @@ async function ensureFreshIdToken() {
     currentIdToken = idToken;
     currentTokenExpiry = getTokenExpiryMs(idToken);
     const claims = decodeJwtPayload(idToken);
+    currentUserUid = user.uid || currentUserUid || extractUidFromClaims(claims);
+    currentUserEmail =
+      user.email || currentUserEmail || extractEmailFromClaims(claims);
     if (!currentCompanyId) currentCompanyId = extractCompanyIdFromClaims(claims);
     saveAuthToDisk();
     return currentIdToken;
@@ -571,6 +590,8 @@ async function ensureFreshIdToken() {
     currentRefreshToken = refreshed.refreshToken || currentRefreshToken;
     currentTokenExpiry = refreshed.expiresAt;
     const claims = decodeJwtPayload(currentIdToken);
+    if (!currentUserUid) currentUserUid = extractUidFromClaims(claims);
+    if (!currentUserEmail) currentUserEmail = extractEmailFromClaims(claims);
     if (!currentCompanyId) currentCompanyId = extractCompanyIdFromClaims(claims);
     saveAuthToDisk();
     return currentIdToken;
@@ -2269,7 +2290,7 @@ async function claimNextUtrWritebackJob() {
         },
       },
       headers: companyId ? { "x-company-id": companyId } : {},
-      timeoutMs: PDF_JOB_REQUEST_TIMEOUT_MS,
+      timeoutMs: UTR_BACKEND_REQUEST_TIMEOUT_MS,
     },
     { stage: "claim", path: UTR_JOB_CLAIM_PATH }
   );
@@ -2290,7 +2311,11 @@ async function claimNextUtrWritebackJob() {
 }
 
 function resolveWorkerCompanyId() {
-  return resolveCompanyId() || currentUserUid || null;
+  const companyId = resolveCompanyId();
+  if (companyId) return companyId;
+  if (currentUserUid) return currentUserUid;
+  const claims = decodeJwtPayload(currentIdToken);
+  return extractUidFromClaims(claims) || null;
 }
 
 async function markUtrJobComplete(jobId, payload) {
@@ -2316,7 +2341,7 @@ async function markUtrJobComplete(jobId, payload) {
     {
       method: "POST",
       payload,
-      timeoutMs: PDF_JOB_REQUEST_TIMEOUT_MS,
+      timeoutMs: UTR_BACKEND_REQUEST_TIMEOUT_MS,
     },
     { stage: "complete", path: pathWithId }
   );
@@ -2353,7 +2378,7 @@ async function markUtrJobFailed(jobId, errorMessage, extra = {}) {
     {
       method: "POST",
       payload,
-      timeoutMs: PDF_JOB_REQUEST_TIMEOUT_MS,
+      timeoutMs: UTR_BACKEND_REQUEST_TIMEOUT_MS,
     },
     { stage: "fail", path: pathWithId }
   );
@@ -2883,6 +2908,7 @@ function stopUtrWritebackWorker(reason = "manual") {
 
 function getUtrWorkerStatus() {
   const configIssues = validateUtrWorkerConfig();
+  const claims = decodeJwtPayload(currentIdToken);
   return {
     enabled: ENABLE_UTR_WRITEBACK_WORKER,
     running: utrWorkerRunning,
@@ -2899,7 +2925,7 @@ function getUtrWorkerStatus() {
     configValid: configIssues.length === 0,
     configIssues,
     hasIdToken: Boolean(currentIdToken),
-    userUid: currentUserUid || null,
+    userUid: currentUserUid || extractUidFromClaims(claims) || null,
     companyId: resolveWorkerCompanyId() || null,
   };
 }
