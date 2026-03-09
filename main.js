@@ -114,7 +114,7 @@ const PDF_STRICT_TALLY_LAYOUT = parseBooleanEnv(
 );
 const ENABLE_UTR_WRITEBACK_WORKER = parseBooleanEnv(
   process.env.ENABLE_UTR_WRITEBACK_WORKER,
-  false
+  true
 );
 const UTR_WRITEBACK_POLL_MS = Number(process.env.UTR_WRITEBACK_POLL_MS || 5000);
 const UTR_JOB_CLAIM_PATH =
@@ -766,7 +766,7 @@ app.whenReady().then(() => {
   loadAuthFromDisk();
 
   createWindow();
-  if (currentIdToken) {
+  if (currentIdToken || currentRefreshToken || firebase.auth().currentUser) {
     startPdfWorker("app_ready_with_saved_session");
     startUtrWritebackWorker("app_ready_with_saved_session");
   }
@@ -1095,6 +1095,9 @@ ipcMain.handle("sync-from-tally", async () => {
 
   try {
     await ensureFreshIdToken();
+    // Self-heal: if session was restored via refresh token, ensure workers are running.
+    startPdfWorker("sync_session_refresh");
+    startUtrWritebackWorker("sync_session_refresh");
     const companyId = resolveCompanyId();
     const companyHint = resolveTallyCompanyHint();
 
@@ -3482,6 +3485,9 @@ ipcMain.handle('start-sync', async (event, data) => {
 
     try {
       await ensureFreshIdToken();
+      // Self-heal: keep background workers alive in case app resumed with restored auth.
+      startPdfWorker("start_sync_session_refresh");
+      startUtrWritebackWorker("start_sync_session_refresh");
       const companyId = resolveCompanyId();
       const companyHint = resolveTallyCompanyHint();
 
