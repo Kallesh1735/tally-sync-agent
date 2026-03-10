@@ -81,7 +81,7 @@ const BACKEND_REQUEST_TIMEOUT_MS = Number(process.env.BACKEND_TIMEOUT_MS || 3000
 const TALLY_REQUEST_RETRIES = Number(process.env.TALLY_RETRY_COUNT || 0);
 const TALLY_RETRY_DELAY_MS = Number(process.env.TALLY_RETRY_DELAY_MS || 1500);
 const TALLY_REPORT_ORDER = (process.env.TALLY_REPORT_ORDER ||
-  "Day Book,Vouchers,Voucher Register (Sales),Voucher Register")
+  "Vouchers,Voucher Register (Sales),Voucher Register,Day Book")
   .split(",")
   .map((x) => x.trim())
   .filter(Boolean);
@@ -161,6 +161,7 @@ let pdfWorkerBusy = false;
 let utrWorkerTimer = null;
 let utrWorkerRunning = false;
 let utrWorkerBusy = false;
+let syncInProgress = false;
 
 console.log(
   "Timeouts:",
@@ -1078,6 +1079,10 @@ ${companyXml}
 // -----------------------------
 ipcMain.handle("sync-from-tally", async () => {
   console.log("IPC received: sync-from-tally");
+  if (syncInProgress) {
+    return { status: "warning", message: "Sync already in progress. Please wait." };
+  }
+  syncInProgress = true;
 
   const syncId = createSyncId();
   writeSyncLog({
@@ -1147,6 +1152,8 @@ ipcMain.handle("sync-from-tally", async () => {
       error: err.message,
     });
     return { status: "error", message: err.message };
+  } finally {
+    syncInProgress = false;
   }
 });
 
@@ -1719,7 +1726,7 @@ function requestTallyRaw(xml, timeoutMs = PDF_TALLY_REQUEST_TIMEOUT_MS) {
     );
 
     const timeoutHandle = setTimeout(() => {
-      req.destroy(new Error(`Tally PDF request timed out after ${timeoutMs}ms`));
+      req.destroy(new Error(`Tally request timed out after ${timeoutMs}ms`));
     }, timeoutMs);
 
     req.on("error", (err) => {
@@ -3503,6 +3510,11 @@ ipcMain.handle('start-sync', async (event, data) => {
   if (!selectedSyncMethod) return { status: 'error', message: 'No sync method selected' };
 
   if (selectedSyncMethod === SYNC_METHODS.LIVE) {
+    if (syncInProgress) {
+      return { status: "warning", message: "Sync already in progress. Please wait." };
+    }
+    syncInProgress = true;
+
     const isFullSync = Boolean(data && data.forceFullSync);
     const syncId = createSyncId();
     writeSyncLog({
@@ -3585,6 +3597,8 @@ ipcMain.handle('start-sync', async (event, data) => {
         msg = 'Tally did not respond in time. Please try again.';
       }
       return { status: 'error', message: msg };
+    } finally {
+      syncInProgress = false;
     }
   }
 
