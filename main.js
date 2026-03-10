@@ -3,6 +3,18 @@
 // - Creates app window
 // - Handles Firebase login + token persistence
 // - Fetches Sales Vouchers (Invoices) from Tally on Sync
+//
+// Quick section map:
+// 1) Config & runtime state
+// 2) Sync checkpoint/date-window utilities
+// 3) Auth/token lifecycle
+// 4) Logging/diagnostics helpers
+// 5) Tally fetch + invoice sync pipelines
+// 6) Backend API wrappers
+// 7) PDF worker
+// 8) UTR writeback worker + Tally receipt import
+// 9) Invoice XML parsing
+// 10) IPC handlers
 console.log("USING MAIN.JS FROM:", __filename);
 
 const { XMLParser } = require("fast-xml-parser");
@@ -91,7 +103,7 @@ const SYNC_OVERLAP_DAYS = Number(process.env.SYNC_OVERLAP_DAYS || 1);
 const SYNC_FULL_LOOKBACK_DAYS = Number(process.env.SYNC_FULL_LOOKBACK_DAYS || 365);
 const SYNC_FUTURE_BUFFER_DAYS = Number(process.env.SYNC_FUTURE_BUFFER_DAYS || 0);
 const lastSyncFilePath = path.join(app.getPath("userData"), "lastSync.json");
-const ENABLE_PDF_WORKER = parseBooleanEnv(process.env.ENABLE_PDF_WORKER, false);
+const ENABLE_PDF_WORKER = parseBooleanEnv(process.env.ENABLE_PDF_WORKER, true);
 const PDF_WORKER_POLL_MS = Number(process.env.PDF_WORKER_POLL_MS || 3000);
 const PDF_JOB_REQUEST_TIMEOUT_MS = Number(
   process.env.PDF_JOB_REQUEST_TIMEOUT_MS || BACKEND_REQUEST_TIMEOUT_MS
@@ -148,6 +160,13 @@ const UTR_WRITEBACK_DRY_RUN = parseBooleanEnv(
   process.env.UTR_WRITEBACK_DRY_RUN,
   false
 );
+const UTR_CAPTURE_RECEIPT_NUMBER = parseBooleanEnv(
+  process.env.UTR_CAPTURE_RECEIPT_NUMBER,
+  true
+);
+const UTR_RECEIPT_LOOKUP_TIMEOUT_MS = Number(
+  process.env.UTR_RECEIPT_LOOKUP_TIMEOUT_MS || Math.min(UTR_TALLY_TIMEOUT_MS, 8000)
+);
 const DEFAULT_RECEIPT_VOUCHER_TYPE =
   process.env.UTR_RECEIPT_VOUCHER_TYPE || "Receipt";
 const DEFAULT_RECEIPT_BANK_LEDGER =
@@ -199,6 +218,8 @@ console.log(
   `UTR_QUEUE_DRAIN_MAX_PER_TICK=${UTR_QUEUE_DRAIN_MAX_PER_TICK}`,
   `UTR_BACKEND_RETRY_COUNT=${UTR_BACKEND_RETRY_COUNT}`,
   `UTR_WRITEBACK_DRY_RUN=${UTR_WRITEBACK_DRY_RUN}`,
+  `UTR_CAPTURE_RECEIPT_NUMBER=${UTR_CAPTURE_RECEIPT_NUMBER}`,
+  `UTR_RECEIPT_LOOKUP_TIMEOUT_MS=${UTR_RECEIPT_LOOKUP_TIMEOUT_MS}`,
   `UTR_RECEIPT_VOUCHER_TYPE=${DEFAULT_RECEIPT_VOUCHER_TYPE}`,
   `UTR_BANK_TRANSACTION_TYPE=${DEFAULT_BANK_TRANSACTION_TYPE}`
 );
@@ -207,6 +228,9 @@ function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+// -----------------------------
+// Sync Checkpoint + Date Window
+// -----------------------------
 function formatYMDDate(d) {
   const y = d.getFullYear();
   const m = String(d.getMonth() + 1).padStart(2, "0");
@@ -410,6 +434,9 @@ function getSyncWindowPreview(options = {}) {
   };
 }
 
+// -----------------------------
+// Auth / Token Lifecycle Helpers
+// -----------------------------
 function decodeJwtPayload(token) {
   try {
     if (!token || typeof token !== "string") return null;
@@ -605,6 +632,9 @@ async function ensureFreshIdToken() {
   throw new Error("Session expired. Please login again.");
 }
 
+// -----------------------------
+// Logging + Runtime Diagnostics
+// -----------------------------
 function resolveCompanyId() {
   const env =
     process.env.GIROPIE_COMPANY_ID ||
@@ -868,6 +898,7 @@ function fetchSalesVouchersFromTally(options = {}) {
     const SVFROMDATE = formatYMD(syncWindow.fromDate);
     const SVTODATE = formatYMD(syncWindow.toDate);
 
+    // Build one Tally "Export Data" XML request for a specific report/date/company.
     const buildXml = (reportName, requestCompany) => {
       const companyXml = requestCompany
         ? `\n          <SVCURRENTCOMPANY>${escapeXml(requestCompany)}</SVCURRENTCOMPANY>`
@@ -928,6 +959,7 @@ ${companyXml}
       },
     };
 
+    // Fire a single HTTP request to Tally port 9000.
     const sendXml = (xml) =>
       new Promise((resOut, rejOut) => {
         const opts = Object.assign({}, optionsBase, {
@@ -963,6 +995,7 @@ ${companyXml}
         req.end();
       });
 
+    // Retries are only transport retries (timeout/connection), not business retries.
     const sendXmlWithRetry = async (xml, reportName) => {
       let lastErr = null;
       const totalAttempts = Math.max(0, TALLY_REQUEST_RETRIES) + 1;
@@ -994,6 +1027,10 @@ ${companyXml}
         ? [companyHint, null]
         : [null];
 
+      // Search strategy:
+      // 1) Iterate candidate company contexts.
+      // 2) For each, iterate report variants in configured order.
+      // 3) First response containing <VOUCHER> wins.
       for (const requestCompany of requestCompanies) {
         for (const r of tryReports) {
           try {
@@ -1213,6 +1250,9 @@ function sendInvoicesToBackend(invoices, options = {}) {
   });
 }
 
+// -----------------------------
+// Backend HTTP Utilities
+// -----------------------------
 function buildBackendUrl(apiPath) {
   if (!BACKEND_BASE_URL) {
     throw new Error("BACKEND_BASE_URL is not configured");
@@ -1353,6 +1393,9 @@ async function requestBackendJson(url, options = {}) {
   }
 }
 
+// -----------------------------
+// PDF Worker: Queue Claim/Complete/Fail
+// -----------------------------
 async function claimNextPdfJob() {
   const companyId = resolveCompanyId();
   writeSyncLog({
@@ -1449,6 +1492,9 @@ async function markPdfJobFailed(jobId, errorMessage) {
   return res;
 }
 
+// -----------------------------
+// Generic Normalizers / Parsers
+// -----------------------------
 function readPdfFromLocalPath(localPdfPath) {
   const absPath = path.resolve(localPdfPath);
   const bytes = fs.readFileSync(absPath);
@@ -1700,6 +1746,9 @@ function buildStaticVariablesXml(entries) {
   return lines.join("\n");
 }
 
+// -----------------------------
+// Tally XML Request Helpers
+// -----------------------------
 function requestTallyRaw(xml, timeoutMs = PDF_TALLY_REQUEST_TIMEOUT_MS) {
   return new Promise((resolve, reject) => {
     const req = http.request(
@@ -1738,6 +1787,9 @@ function requestTallyRaw(xml, timeoutMs = PDF_TALLY_REQUEST_TIMEOUT_MS) {
   });
 }
 
+// -----------------------------
+// PDF Worker: Tally Printable Export
+// -----------------------------
 async function fetchInvoicePrintHtmlFromTally(job) {
   const jobId = job.jobId || job.id || null;
   const identity = resolvePdfIdentity(job);
@@ -2274,6 +2326,9 @@ function getPdfWorkerStatus() {
   };
 }
 
+// -----------------------------
+// UTR Worker: Queue Claim/Complete/Fail
+// -----------------------------
 async function claimNextUtrWritebackJob() {
   // Claim API contract:
   // - 200 with a job => process immediately.
@@ -2409,6 +2464,9 @@ async function markUtrJobFailed(jobId, errorMessage, extra = {}) {
   return res;
 }
 
+// -----------------------------
+// UTR Writeback: Payload + Receipt XML
+// -----------------------------
 function resolveUtrWritebackPayload(job) {
   // Normalize and validate job payload before attempting Tally import.
   // We fail fast here so backend gets a clear MATCH_FAIL reason.
@@ -2612,6 +2670,164 @@ function parseTallyImportSummary(rawBody) {
   };
 }
 
+function extractReceiptNumberFromImportResponse(rawBody) {
+  const body = typeof rawBody === "string" ? rawBody : "";
+  if (!body) return null;
+  const tags = [
+    "LASTVOUCHERNUMBER",
+    "VOUCHERNUMBER",
+    "LASTVCHNUMBER",
+    "VCHNUMBER",
+  ];
+  for (const tag of tags) {
+    const match = body.match(new RegExp(`<${tag}>([^<]+)</${tag}>`, "i"));
+    const value = normalizeDisplayValue(match && match[1] ? match[1] : null);
+    if (value) return value;
+  }
+  return null;
+}
+
+function parseTallyXmlEnvelope(rawXml) {
+  const parser = new XMLParser({
+    ignoreAttributes: false,
+    attributeNamePrefix: "@_",
+    parseTagValue: true,
+    trimValues: true,
+  });
+  return parser.parse(rawXml);
+}
+
+function collectVouchersFromNode(node, out) {
+  if (!node || typeof node !== "object") return;
+  if (node.VOUCHER) {
+    if (Array.isArray(node.VOUCHER)) out.push(...node.VOUCHER);
+    else out.push(node.VOUCHER);
+  }
+  for (const key of Object.keys(node)) {
+    const child = node[key];
+    if (Array.isArray(child)) child.forEach((x) => collectVouchersFromNode(x, out));
+    else if (typeof child === "object") collectVouchersFromNode(child, out);
+  }
+}
+
+function readVoucherField(obj, name) {
+  if (!obj || typeof obj !== "object") return null;
+  if (obj[name] !== undefined) return obj[name];
+  if (obj[`@_${name}`] !== undefined) return obj[`@_${name}`];
+  if (obj["#text"] !== undefined) return obj["#text"];
+  return null;
+}
+
+function isSameVoucherType(received, expected) {
+  const a = String(received || "").trim().toLowerCase();
+  const b = String(expected || "").trim().toLowerCase();
+  if (!a || !b) return false;
+  return a === b || a.includes(b) || b.includes(a);
+}
+
+function chooseBestReceiptVoucherNumber(vouchersXml, payload) {
+  let json;
+  try {
+    json = parseTallyXmlEnvelope(vouchersXml);
+  } catch (err) {
+    return null;
+  }
+
+  const body = json && json.ENVELOPE ? json.ENVELOPE.BODY : null;
+  if (!body) return null;
+
+  const vouchers = [];
+  collectVouchersFromNode(body, vouchers);
+  if (!vouchers.length) return null;
+
+  let best = null;
+  for (const voucher of vouchers) {
+    const voucherNo = normalizeDisplayValue(readVoucherField(voucher, "VOUCHERNUMBER"));
+    if (!voucherNo) continue;
+
+    const voucherType = normalizeDisplayValue(
+      readVoucherField(voucher, "VOUCHERTYPENAME") || readVoucherField(voucher, "VCHTYPE")
+    );
+    if (!isSameVoucherType(voucherType, payload.voucherTypeName)) continue;
+
+    const voucherDate = normalizeDateToYmd(readVoucherField(voucher, "DATE"));
+    const narration = normalizeDisplayValue(readVoucherField(voucher, "NARRATION")) || "";
+    const partyName =
+      normalizeDisplayValue(
+        readVoucherField(voucher, "PARTYLEDGERNAME") ||
+          readVoucherField(voucher, "PARTYNAME")
+      ) || "";
+    const reference = normalizeDisplayValue(readVoucherField(voucher, "REFERENCE")) || "";
+
+    let score = 0;
+    if (voucherDate && payload.paymentDateYmd && voucherDate === payload.paymentDateYmd) score += 1;
+    if (partyName && payload.customerName && partyName.toLowerCase() === payload.customerName.toLowerCase()) score += 2;
+    if (reference && payload.utrNumber && reference.toLowerCase() === payload.utrNumber.toLowerCase()) score += 2;
+    if (narration && payload.utrNumber && narration.toLowerCase().includes(payload.utrNumber.toLowerCase())) score += 3;
+    if (narration && payload.paymentId && narration.toLowerCase().includes(payload.paymentId.toLowerCase())) score += 5;
+
+    if (!best || score > best.score) {
+      best = { score, voucherNo };
+    }
+  }
+
+  return best && best.score >= 2 ? best.voucherNo : null;
+}
+
+function buildReceiptLookupXml(payload) {
+  const staticVars = buildStaticVariablesXml({
+    ...(payload.companyName ? { SVCURRENTCOMPANY: payload.companyName } : {}),
+    SVFROMDATE: payload.paymentDateYmd,
+    SVTODATE: payload.paymentDateYmd,
+    SVEXPORTFORMAT: "$$SysName:XML",
+    EXPLODEFLAG: "Yes",
+  });
+  return `
+<ENVELOPE>
+  <HEADER>
+    <TALLYREQUEST>Export Data</TALLYREQUEST>
+  </HEADER>
+  <BODY>
+    <EXPORTDATA>
+      <REQUESTDESC>
+        <REPORTNAME>Vouchers</REPORTNAME>
+        <STATICVARIABLES>
+${staticVars}
+        </STATICVARIABLES>
+      </REQUESTDESC>
+    </EXPORTDATA>
+  </BODY>
+</ENVELOPE>
+`;
+}
+
+async function resolveCreatedReceiptNumber(payload, importResponseBody) {
+  const fromImportResponse = extractReceiptNumberFromImportResponse(importResponseBody);
+  if (fromImportResponse) {
+    return { voucherNumber: fromImportResponse, source: "import_response" };
+  }
+
+  try {
+    const lookupXml = buildReceiptLookupXml(payload);
+    const lookupResp = await requestTallyRaw(lookupXml, UTR_RECEIPT_LOOKUP_TIMEOUT_MS);
+    const fromLookup = chooseBestReceiptVoucherNumber(lookupResp.body, payload);
+    if (fromLookup) {
+      return { voucherNumber: fromLookup, source: "voucher_lookup" };
+    }
+  } catch (err) {
+    // Non-fatal. We keep writeback success even if receipt-number lookup times out/fails.
+    writeSyncLog({
+      ts: new Date().toISOString(),
+      level: "warn",
+      event: "utr_receipt_lookup_failed",
+      jobId: payload.jobId,
+      error: err && err.message ? err.message : String(err),
+    });
+  }
+
+  return null;
+}
+
 async function writeUtrReceiptToTally(job) {
   // Stage 1: create receipt XML and import into Tally over port 9000.
   const payload = resolveUtrWritebackPayload(job);
@@ -2681,15 +2897,42 @@ async function writeUtrReceiptToTally(job) {
     throw new Error("TALLY_IMPORT_FAIL: No voucher created/altered");
   }
 
+  let resolvedVoucherNumber = null;
+  let receiptRefSource = "fallback";
+  if (UTR_CAPTURE_RECEIPT_NUMBER) {
+    const resolved = await resolveCreatedReceiptNumber(payload, resp.body);
+    if (resolved && resolved.voucherNumber) {
+      resolvedVoucherNumber = resolved.voucherNumber;
+      receiptRefSource = resolved.source || "unknown";
+    }
+  }
+
+  const tallyReceiptRef = resolvedVoucherNumber
+    ? `${payload.voucherTypeName}/${resolvedVoucherNumber}`
+    : `${payload.voucherTypeName}/${payload.billRefName}/${payload.paymentDateYmd}`;
+
+  writeSyncLog({
+    ts: new Date().toISOString(),
+    level: "info",
+    event: "utr_receipt_reference_resolved",
+    jobId: payload.jobId,
+    receiptRefSource,
+    voucherNumber: resolvedVoucherNumber || null,
+    tallyReceiptRef,
+  });
+
   return {
     dryRun: false,
     writtenUtr: payload.utrNumber,
-    tallyReceiptRef: `${payload.voucherTypeName}/${payload.billRefName}/${payload.paymentDateYmd}`,
+    tallyReceiptRef,
     summary,
     payload,
   };
 }
 
+// -----------------------------
+// UTR Worker Loop + Health Status
+// -----------------------------
 async function processOneUtrWritebackJob() {
   // Stage 0: claim one pending job.
   // Contract: each claimed job must end in exactly one terminal callback (complete or fail).
@@ -2971,6 +3214,9 @@ function getUtrWorkerStatus() {
   };
 }
 
+// -----------------------------
+// Tally Invoice XML -> Canonical Invoice Model
+// -----------------------------
 function extractInvoicesFromTallyXML(xml, options = {}) {
   const parser = new XMLParser({
     ignoreAttributes: false,
