@@ -120,6 +120,8 @@ const PDF_TALLY_REQUEST_TIMEOUT_MS = Number(
 const PDF_HTML_RENDER_TIMEOUT_MS = Number(
   process.env.PDF_HTML_RENDER_TIMEOUT_MS || 30000
 );
+const PDF_HTML_MIN_LENGTH = Number(process.env.PDF_HTML_MIN_LENGTH || 5000);
+const PDF_HTML_MIN_MARKERS = Number(process.env.PDF_HTML_MIN_MARKERS || 3);
 const PDF_STRICT_TALLY_LAYOUT = parseBooleanEnv(
   process.env.PDF_STRICT_TALLY_LAYOUT,
   true
@@ -205,6 +207,8 @@ console.log(
   `PDF_WORKER_POLL_MS=${PDF_WORKER_POLL_MS}`,
   `PDF_JOB_CLAIM_PATH=${PDF_JOB_CLAIM_PATH}`,
   `PDF_TALLY_TIMEOUT_MS=${PDF_TALLY_REQUEST_TIMEOUT_MS}`,
+  `PDF_HTML_MIN_LENGTH=${PDF_HTML_MIN_LENGTH}`,
+  `PDF_HTML_MIN_MARKERS=${PDF_HTML_MIN_MARKERS}`,
   `PDF_STRICT_TALLY_LAYOUT=${PDF_STRICT_TALLY_LAYOUT}`
 );
 console.log(
@@ -1543,12 +1547,46 @@ function ymdToDdMmYyyy(ymd) {
   return `${raw.slice(6, 8)}-${raw.slice(4, 6)}-${raw.slice(0, 4)}`;
 }
 
+function ymdToDdMmmYy(ymd) {
+  if (!ymd || !/^\d{8}$/.test(String(ymd))) return null;
+  const raw = String(ymd);
+  const monthNames = [
+    "Jan",
+    "Feb",
+    "Mar",
+    "Apr",
+    "May",
+    "Jun",
+    "Jul",
+    "Aug",
+    "Sep",
+    "Oct",
+    "Nov",
+    "Dec",
+  ];
+  const monthIndex = Number(raw.slice(4, 6)) - 1;
+  const month = monthNames[monthIndex];
+  if (!month) return null;
+  return `${raw.slice(6, 8)}-${month}-${raw.slice(2, 4)}`;
+}
+
+function ymdToIsoDate(ymd) {
+  if (!ymd || !/^\d{8}$/.test(String(ymd))) return null;
+  const raw = String(ymd);
+  return `${raw.slice(0, 4)}-${raw.slice(4, 6)}-${raw.slice(6, 8)}`;
+}
+
 function buildTallyDateVariants(rawDate) {
   const ymd = normalizeDateToYmd(rawDate);
   if (!ymd) return [];
   const variants = [ymd];
   const ddmmyyyy = ymdToDdMmYyyy(ymd);
   if (ddmmyyyy) variants.push(ddmmyyyy);
+  const ddmmmyy = ymdToDdMmmYy(ymd);
+  if (ddmmmyy) variants.push(ddmmmyy);
+  const isoDate = ymdToIsoDate(ymd);
+  if (isoDate) variants.push(isoDate);
+  if (ddmmyyyy) variants.push(ddmmyyyy.replace(/-/g, "/"));
   return [...new Set(variants.filter(Boolean))];
 }
 
@@ -1702,6 +1740,131 @@ function computePdfWindowFromJob(job, overrideDateYmd = null) {
   };
 }
 
+function normalizeForMatch(value) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function stripHtmlToText(html) {
+  return String(html || "")
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function escapeRegex(value) {
+  return String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function validateTallyPdfHtmlQuality({ html, identity, job }) {
+  const htmlLength = String(html || "").length;
+  const text = stripHtmlToText(html);
+  const normalizedText = normalizeForMatch(text);
+  const expectedVoucherType = normalizeForMatch(identity && identity.voucherTypeName);
+  const expectedCustomer = normalizeForMatch(
+    getJobField(job, "customerName", "partyName", "ledgerName")
+  );
+  const expectedInvoiceNo = normalizeForMatch(identity && identity.invoiceNo);
+  const expectedInvoiceNoRaw = String((identity && identity.invoiceNo) || "").trim();
+
+  const contains = (needle) => {
+    const n = normalizeForMatch(needle);
+    return n ? normalizedText.includes(n) : false;
+  };
+
+  const hasExactInvoiceNoToken = (() => {
+    if (!expectedInvoiceNoRaw) return false;
+    const rx = new RegExp(`(?:^|\\D)${escapeRegex(expectedInvoiceNoRaw)}(?:\\D|$)`, "i");
+    return rx.test(text);
+  })();
+
+  const hasLabelledInvoiceNo = (() => {
+    if (!expectedInvoiceNoRaw) return false;
+    const rx = new RegExp(
+      `(?:invoice\\s*no|voucher\\s*no|bill\\s*no)[^\\dA-Za-z]{0,12}${escapeRegex(
+        expectedInvoiceNoRaw
+      )}(?:\\D|$)`,
+      "i"
+    );
+    return rx.test(text);
+  })();
+
+  const looksInvoice = /\binvoice\b/i.test(text) || /\bsales\b/i.test(text);
+  const looksReceipt = /\breceipt\b/i.test(text);
+
+  const markers = {
+    hasInvoiceNo: expectedInvoiceNo ? hasLabelledInvoiceNo || hasExactInvoiceNoToken || contains(expectedInvoiceNo) : false,
+    hasExactInvoiceNoToken,
+    hasLabelledInvoiceNo,
+    hasInvoiceKeywords: /\binvoice\s*no\b/i.test(text) || /\bvoucher\s*no\b/i.test(text),
+    hasCustomerName: expectedCustomer ? contains(expectedCustomer) : false,
+    hasPartyKeywords: /\bparty\b/i.test(text) || /\bcustomer\b/i.test(text),
+    hasAmountKeywords: /\btotal\b/i.test(text) || /\bamount\b/i.test(text) || /\bnet amount\b/i.test(text),
+    hasLineItemKeywords:
+      /\bdescription of goods\b/i.test(text) ||
+      /\bquantity\b/i.test(text) ||
+      /\brate\b/i.test(text) ||
+      /\bhsn\b/i.test(text),
+    voucherTypeLooksCorrect:
+      expectedVoucherType.includes("sale")
+        ? looksInvoice && !looksReceipt
+        : true,
+  };
+
+  const hasInvoiceIdentity = expectedInvoiceNo
+    ? markers.hasInvoiceNo
+    : markers.hasInvoiceKeywords;
+  // If job payload does not include customerName, skip this strict check.
+  const hasCustomerIdentity = expectedCustomer ? markers.hasCustomerName : true;
+  const hasMonetaryContext = markers.hasAmountKeywords;
+  const hasLayoutEvidence = markers.hasLineItemKeywords || looksInvoice;
+  const requiredChecks = {
+    hasInvoiceIdentity,
+    hasCustomerIdentity,
+    hasMonetaryContext,
+    hasLayoutEvidence,
+  };
+  const requiredOk =
+    requiredChecks.hasInvoiceIdentity &&
+    requiredChecks.hasCustomerIdentity &&
+    requiredChecks.hasMonetaryContext &&
+    requiredChecks.hasLayoutEvidence;
+
+  let matched = 0;
+  if (markers.hasInvoiceNo || markers.hasInvoiceKeywords) matched += 1;
+  if (markers.hasCustomerName || markers.hasPartyKeywords) matched += 1;
+  if (markers.hasAmountKeywords) matched += 1;
+  if (markers.hasLineItemKeywords) matched += 1;
+  if (markers.voucherTypeLooksCorrect) matched += 1;
+
+  const lengthOk = htmlLength >= PDF_HTML_MIN_LENGTH;
+  const markerOk = matched >= PDF_HTML_MIN_MARKERS;
+  const ok = lengthOk && markerOk && requiredOk && markers.voucherTypeLooksCorrect;
+
+  return {
+    ok,
+    htmlLength,
+    matchedMarkers: matched,
+    minRequiredMarkers: PDF_HTML_MIN_MARKERS,
+    markers,
+    requiredChecks,
+    requiredOk,
+    expected: {
+      voucherTypeName: identity && identity.voucherTypeName ? identity.voucherTypeName : "Sales",
+      invoiceNo: identity && identity.invoiceNo ? identity.invoiceNo : null,
+      customerName: getJobField(job, "customerName", "partyName", "ledgerName") || null,
+    },
+  };
+}
+
 function extractTallyLineError(raw) {
   if (!raw || typeof raw !== "string") return null;
   const match = raw.match(/<LINEERROR>([\s\S]*?)<\/LINEERROR>/i);
@@ -1817,11 +1980,36 @@ async function fetchInvoicePrintHtmlFromTally(job) {
   });
 
   const window = computePdfWindowFromJob(job, identity.invoiceDateYmd);
-  const reportNames = [
-    "Voucher Printing",
-    "Voucher",
-    "Sales Invoice",
-    "Invoice",
+  const reportConfigs = [
+    {
+      name: "Sales Invoice",
+      vars: {
+        SVVIEWNAME: "Invoice Voucher View",
+        SVPRINTTYPE: "Invoice",
+        ISINVOICE: "Yes",
+      },
+    },
+    {
+      name: "Invoice",
+      vars: {
+        SVVIEWNAME: "Invoice Voucher View",
+        SVPRINTTYPE: "Invoice",
+        ISINVOICE: "Yes",
+      },
+    },
+    {
+      name: "Voucher Printing",
+      vars: {
+        SVVIEWNAME: "Invoice Voucher View",
+        SVPRINTTYPE: "Invoice",
+      },
+    },
+    {
+      name: "Voucher",
+      vars: {
+        SVVIEWNAME: "Invoice Voucher View",
+      },
+    },
   ];
   const dateVariants =
     identity.dateVariants.length > 0 ? identity.dateVariants : [null];
@@ -1852,17 +2040,16 @@ async function fetchInvoicePrintHtmlFromTally(job) {
   }
 
   const attempts = [];
-  for (const reportName of reportNames) {
+  for (const reportConfig of reportConfigs) {
     for (const identitySet of identityVarSets) {
       for (const dateVariant of dateVariants) {
         const baseVars = {
           SVEXPORTFORMAT: "$$SysName:HTML",
           SVFROMDATE: window.fromDateYmd,
           SVTODATE: window.toDateYmd,
-          SVVIEWNAME: "Invoice Voucher View",
           EXPLODEFLAG: "Yes",
           SVVOUCHERTYPENAME: identity.voucherTypeName || "Sales",
-          SVPRINTTYPE: "Invoice",
+          ...reportConfig.vars,
           ...(identity.companyName
             ? { SVCURRENTCOMPANY: identity.companyName }
             : {}),
@@ -1876,14 +2063,14 @@ async function fetchInvoicePrintHtmlFromTally(job) {
         }
         attempts.push({
           shape: "export_data",
-          reportName,
+          reportName: reportConfig.name,
           identitySetName: identitySet.name,
           dateVariant: dateVariant || "none",
           vars: baseVars,
         });
         attempts.push({
           shape: "export",
-          reportName,
+          reportName: reportConfig.name,
           identitySetName: identitySet.name,
           dateVariant: dateVariant || "none",
           vars: baseVars,
@@ -1893,6 +2080,7 @@ async function fetchInvoicePrintHtmlFromTally(job) {
   }
 
   const failures = [];
+  const qualityFailures = [];
 
   for (let i = 0; i < attempts.length; i += 1) {
     const attempt = attempts[i];
@@ -1953,24 +2141,55 @@ ${staticVarsXml}
       const html = extractHtmlFromTallyPayload(resp.body);
       const lineError = extractTallyLineError(resp.body);
       if (html && html.length > 100) {
+        const quality = validateTallyPdfHtmlQuality({
+          html,
+          identity,
+          job,
+        });
+        const decision = quality.ok ? "accept" : "reject";
         writeSyncLog({
           ts: new Date().toISOString(),
-          level: "info",
-          event: "pdf_tally_html_found",
+          level: quality.ok ? "info" : "warn",
+          event: "pdf_tally_html_quality",
           jobId,
+          voucherTypeNameUsed: identity.voucherTypeName || "Sales",
           reportName: attempt.reportName,
           shape: attempt.shape,
           identitySet: attempt.identitySetName,
           dateVariant: attempt.dateVariant,
-          statusCode: resp.statusCode,
+          htmlLength: quality.htmlLength,
+          matchedMarkers: quality.matchedMarkers,
+          minRequiredMarkers: quality.minRequiredMarkers,
+          markers: quality.markers,
+          requiredChecks: quality.requiredChecks,
+          requiredOk: quality.requiredOk,
+          decision,
         });
-        return {
-          html,
-          reportName: attempt.reportName,
-          shape: attempt.shape,
-          identitySet: attempt.identitySetName,
-          dateVariant: attempt.dateVariant,
-        };
+        if (quality.ok) {
+          writeSyncLog({
+            ts: new Date().toISOString(),
+            level: "info",
+            event: "pdf_tally_html_found",
+            jobId,
+            reportName: attempt.reportName,
+            shape: attempt.shape,
+            identitySet: attempt.identitySetName,
+            dateVariant: attempt.dateVariant,
+            statusCode: resp.statusCode,
+          });
+          return {
+            html,
+            reportName: attempt.reportName,
+            shape: attempt.shape,
+            identitySet: attempt.identitySetName,
+            dateVariant: attempt.dateVariant,
+          };
+        }
+
+        qualityFailures.push(
+          `#${i + 1} ${attempt.shape}/${attempt.reportName}/${attempt.identitySetName}/${attempt.dateVariant}: htmlLength=${quality.htmlLength} matchedMarkers=${quality.matchedMarkers}/${quality.minRequiredMarkers} requiredOk=${quality.requiredOk} invoiceIdentity=${quality.requiredChecks.hasInvoiceIdentity} customerIdentity=${quality.requiredChecks.hasCustomerIdentity} monetary=${quality.requiredChecks.hasMonetaryContext} layout=${quality.requiredChecks.hasLayoutEvidence}`
+        );
+        continue;
       }
 
       failures.push(
@@ -1987,11 +2206,14 @@ ${staticVarsXml}
     }
   }
 
-  const detail = failures.slice(0, 6).join(" || ");
+  const detail = failures.slice(0, 4).join(" || ");
+  const qualityDetail = qualityFailures.slice(0, 4).join(" || ");
   throw new Error(
-    `TALLY_FETCH: Unable to export printable HTML from Tally for invoice ${
-      identity.invoiceNo || "unknown"
-    }. Attempts=${attempts.length}. Details=${detail || "none"}`
+    `PDF_TALLY_HTML_INCOMPLETE: invoice=${identity.invoiceNo || "unknown"} voucherType=${
+      identity.voucherTypeName || "Sales"
+    } attempts=${attempts.length} qualityFailures=${
+      qualityFailures.length
+    } details=${qualityDetail || detail || "none"}`
   );
 }
 
@@ -2175,7 +2397,11 @@ async function processOnePdfJob() {
       pdfResult = await generateInvoicePdfFromTally(job);
     } catch (err) {
       const msg = err && err.message ? err.message : String(err);
-      if (msg.startsWith("TALLY_FETCH:") || msg.startsWith("PDF_RENDER:")) {
+      if (
+        msg.startsWith("TALLY_FETCH:") ||
+        msg.startsWith("PDF_RENDER:") ||
+        msg.startsWith("PDF_TALLY_HTML_INCOMPLETE:")
+      ) {
         throw err;
       }
       throw new Error(buildStageError("PDF_GENERATE", err));
