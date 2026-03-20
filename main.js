@@ -19,10 +19,9 @@ console.log("USING MAIN.JS FROM:", __filename);
 
 const { XMLParser } = require("fast-xml-parser");
 
-// Production Vercel API URL (HTTPS)
-const BACKEND_SYNC_URL =
-  "https://giro-pie-frontend.vercel.app/api/sync-tally";
+// Production default backend stays unchanged, but all requests should resolve from env-aware base URL.
 const DEFAULT_BACKEND_BASE_URL = "https://giro-pie-frontend.vercel.app";
+const BACKEND_SYNC_PATH = "/api/sync-tally";
 
 function parseBooleanEnv(value, defaultValue = false) {
   if (value === undefined || value === null || value === "") {
@@ -41,11 +40,26 @@ function deriveUrlOrigin(urlString) {
   }
 }
 
+function normalizeBackendBaseUrl(value) {
+  const raw = String(value || "").trim().replace(/\/+$/, "");
+  if (!raw) return "";
+  return raw.replace(/\/api$/i, "");
+}
+
 const BACKEND_BASE_URL = (
   process.env.BACKEND_BASE_URL ||
-  DEFAULT_BACKEND_BASE_URL ||
-  deriveUrlOrigin(BACKEND_SYNC_URL)
-).replace(/\/+$/, "");
+  DEFAULT_BACKEND_BASE_URL
+);
+const NORMALIZED_BACKEND_BASE_URL = normalizeBackendBaseUrl(BACKEND_BASE_URL);
+
+function pickHttpModule(urlString) {
+  try {
+    const parsed = new URL(urlString);
+    return parsed.protocol === "http:" ? http : https;
+  } catch (err) {
+    return https;
+  }
+}
 
 const { app, BrowserWindow, ipcMain } = require("electron");
 const path = require("path");
@@ -201,8 +215,13 @@ console.log(
   `SYNC_FUTURE_BUFFER_DAYS=${SYNC_FUTURE_BUFFER_DAYS}`
 );
 console.log(
+  "Backend:",
+  `BACKEND_BASE_URL=${NORMALIZED_BACKEND_BASE_URL}`,
+  `SYNC_ENDPOINT=${NORMALIZED_BACKEND_BASE_URL}${BACKEND_SYNC_PATH}`
+);
+console.log(
   "PDF worker:",
-  `BACKEND_BASE_URL=${BACKEND_BASE_URL}`,
+  `BACKEND_BASE_URL=${NORMALIZED_BACKEND_BASE_URL}`,
   `ENABLE_PDF_WORKER=${ENABLE_PDF_WORKER}`,
   `PDF_WORKER_POLL_MS=${PDF_WORKER_POLL_MS}`,
   `PDF_JOB_CLAIM_PATH=${PDF_JOB_CLAIM_PATH}`,
@@ -1216,8 +1235,11 @@ function sendInvoicesToBackend(invoices, options = {}) {
 
     if (syncId) headers["X-Sync-Id"] = syncId;
 
-    const req = https.request(
-      BACKEND_SYNC_URL,
+    const syncUrl = buildBackendUrl(BACKEND_SYNC_PATH);
+    const transport = pickHttpModule(syncUrl);
+
+    const req = transport.request(
+      syncUrl,
       {
         method: "POST",
         headers,
@@ -1258,13 +1280,13 @@ function sendInvoicesToBackend(invoices, options = {}) {
 // Backend HTTP Utilities
 // -----------------------------
 function buildBackendUrl(apiPath) {
-  if (!BACKEND_BASE_URL) {
+  if (!NORMALIZED_BACKEND_BASE_URL) {
     throw new Error("BACKEND_BASE_URL is not configured");
   }
   const normalizedPath = String(apiPath || "").startsWith("/")
     ? String(apiPath)
     : `/${String(apiPath || "")}`;
-  return `${BACKEND_BASE_URL}${normalizedPath}`;
+  return `${NORMALIZED_BACKEND_BASE_URL}${normalizedPath}`;
 }
 
 function resolvePathWithJobId(pathTemplate, jobId) {
@@ -1329,7 +1351,8 @@ async function requestBackendJson(url, options = {}) {
         headers["Content-Length"] = Buffer.byteLength(payload);
       }
 
-      const req = https.request(
+      const transport = pickHttpModule(url);
+      const req = transport.request(
         url,
         {
           method: options.method || "GET",
@@ -2545,7 +2568,8 @@ function getPdfWorkerStatus() {
     busy: pdfWorkerBusy,
     pollMs: PDF_WORKER_POLL_MS,
     claimPath: PDF_JOB_CLAIM_PATH,
-    backendBaseUrl: BACKEND_BASE_URL,
+    backendBaseUrl: NORMALIZED_BACKEND_BASE_URL,
+    syncEndpoint: buildBackendUrl(BACKEND_SYNC_PATH),
     hasIdToken: Boolean(currentIdToken),
     userUid: currentUserUid || null,
     companyId: resolveCompanyId() || null,
@@ -3367,7 +3391,7 @@ async function requestBackendJsonWithRetry(url, options = {}, retryMeta = {}) {
 
 function validateUtrWorkerConfig() {
   const issues = [];
-  if (!BACKEND_BASE_URL) issues.push("BACKEND_BASE_URL missing");
+  if (!NORMALIZED_BACKEND_BASE_URL) issues.push("BACKEND_BASE_URL missing");
   if (!UTR_JOB_CLAIM_PATH) issues.push("UTR_JOB_CLAIM_PATH missing");
   if (!UTR_JOB_COMPLETE_PATH) issues.push("UTR_JOB_COMPLETE_PATH missing");
   if (!UTR_JOB_FAIL_PATH) issues.push("UTR_JOB_FAIL_PATH missing");
@@ -3430,7 +3454,7 @@ function getUtrWorkerStatus() {
     claimPath: UTR_JOB_CLAIM_PATH,
     completePath: UTR_JOB_COMPLETE_PATH,
     failPath: UTR_JOB_FAIL_PATH,
-    backendBaseUrl: BACKEND_BASE_URL,
+    backendBaseUrl: NORMALIZED_BACKEND_BASE_URL,
     dryRun: UTR_WRITEBACK_DRY_RUN,
     configValid: configIssues.length === 0,
     configIssues,
